@@ -383,6 +383,9 @@ impl LsmStorageInner {
         }
         let manifest_path = path.join("MANIFEST");
         let mut last_commit_ts = 0;
+        // Recovery rebuilds the timestamp allocator from BOTH sources: SST max_ts
+        // and versions replayed from remaining WALs. File ids and manifest order
+        // are not commit timestamps. The next committed batch uses max_seen + 1.
         if !manifest_path.exists() {
             if options.enable_wal {
                 state.memtable = Arc::new(MemTable::create_with_wal(
@@ -523,6 +526,9 @@ impl LsmStorageInner {
     }
 
     pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        // A point lookup is now a version-range read. Merge raw (key,ts) entries
+        // from memory and disk, then let LsmIterator choose the newest ts<=read_ts.
+        // Finding a too-new value in current memory cannot end this lookup.
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
@@ -602,6 +608,9 @@ impl LsmStorageInner {
     }
 
     pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
+        // Atomic visibility: allocate one ts, write the whole batch to ONE memtable
+        // and WAL, then publish that ts. Snapshots created before publication use
+        // the old ts and ignore every new entry, even if some are already in memory.
         if batch.is_empty() {
             return Ok(self.mvcc().latest_commit_ts());
         }
@@ -632,6 +641,8 @@ impl LsmStorageInner {
             size = guard.memtable.approximate_size();
         }
         self.mvcc().update_commit_ts(ts);
+        // Publish before fallible freeze maintenance: an accepted batch's ts must
+        // never be reused if creating the next memtable or its WAL later fails.
         self.try_freeze(size)?;
         Ok(ts)
     }
@@ -640,6 +651,8 @@ impl LsmStorageInner {
         self: &Arc<Self>,
         batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
+        // When validation is enabled, even ordinary engine writes must go through
+        // a transaction so their write sets enter the conflict history.
         if !self.options.serializable {
             self.write_batch_inner(batch)?;
         } else {
@@ -829,6 +842,9 @@ impl LsmStorageInner {
         upper: Bound<&[u8]>,
         read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
+        // Two orderings coexist: source cursors sort full (user key, descending ts),
+        // but user bounds compare only user bytes. Excluding a lower key must skip
+        // ALL of its versions, hence the while loops in the SST branches below.
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)

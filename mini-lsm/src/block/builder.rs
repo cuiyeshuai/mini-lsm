@@ -31,6 +31,8 @@ pub struct BlockBuilder {
 }
 
 fn compute_overlap(first_key: KeySlice, key: KeySlice) -> usize {
+    // Prefix compression compares against the block's first key. For "apple"
+    // and "apply", overlap=4 and only "y" must be stored for the later key.
     let mut i = 0;
     loop {
         if i >= first_key.len() || i >= key.len() {
@@ -63,6 +65,9 @@ impl BlockBuilder {
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
+        // Read in three stages: validate encoded lengths, decide whether this
+        // block can accept the entry, then append its offset and encoded bytes.
+        // A false result asks SsTableBuilder to finish this block and retry.
         assert!(!key.is_empty(), "key must not be empty");
         let Ok(key_len) = u16::try_from(key.len()) else {
             return false;
@@ -78,6 +83,8 @@ impl BlockBuilder {
         let offset_is_full = self.data.len() > usize::from(u16::MAX);
         let count_is_full = self.offsets.len() >= usize::from(u16::MAX);
         if !self.is_empty() && (block_is_full || offset_is_full || count_is_full) {
+            // A first entry may exceed the target size so an oversized pair can
+            // still make progress. The u16 key/value length limits still apply.
             return false;
         }
         // Add the offset of the data into the offset array.
@@ -85,6 +92,8 @@ impl BlockBuilder {
             return false;
         };
         self.offsets.push(offset);
+        // Entry layout: overlap:u16 | suffix_len:u16 | suffix | value_len:u16 | value.
+        // Offsets point into data and are appended as a separate footer by encode().
         let overlap = compute_overlap(self.first_key.as_key_slice(), key);
         let Ok(overlap) = u16::try_from(overlap) else {
             return false;

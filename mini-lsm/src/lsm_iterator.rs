@@ -24,7 +24,9 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::mem_table::MemTableIterator;
 use crate::table::SsTableIterator;
 
-/// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
+/// Read the nesting as merge(merge(memtables, L0), levels/tiers).
+/// Each TwoMergeIterator prefers its left input on equal keys; each MergeIterator
+/// prefers its earlier input. Together they encode the storage source precedence.
 type LsmIteratorInner = TwoMergeIterator<
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
     MergeIterator<SstConcatIterator>,
@@ -33,6 +35,8 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
+    // Logical scan validity can be false while inner still has keys: those keys
+    // might all lie beyond this scan's upper bound.
     is_valid: bool,
 }
 
@@ -43,6 +47,10 @@ impl LsmIterator {
             inner: iter,
             end_bound,
         };
+        // A lower-bound seek may already land past the upper bound, even before
+        // the caller's first next(). Validate the initial position as well.
+        // Example: scan [b,b], SST keys [a,c]. The seek lands on c; return an
+        // invalid scan immediately rather than exposing c until next() is called.
         iter.check_end_bound();
         iter.move_to_non_delete()?;
         Ok(iter)
@@ -52,6 +60,8 @@ impl LsmIterator {
         if !self.is_valid {
             return;
         }
+        // SST cursors know where to start, but have no upper scan bound. Because
+        // the merged stream is sorted, crossing this bound ends the whole scan.
         match self.end_bound.as_ref() {
             Bound::Unbounded => {}
             Bound::Included(key) => self.is_valid = self.inner.key().raw_ref() <= key.as_ref(),
@@ -60,6 +70,9 @@ impl LsmIterator {
     }
 
     fn next_inner(&mut self) -> Result<()> {
+        // Advance by one distinct merged key, which might still be a tombstone.
+        // Do this helper's exhaustion/bound checks on EVERY raw step, including
+        // the extra steps taken by move_to_non_delete().
         self.inner.next()?;
         if !self.inner.is_valid() {
             self.is_valid = false;
@@ -70,6 +83,10 @@ impl LsmIterator {
     }
 
     fn move_to_non_delete(&mut self) -> Result<()> {
+        // Filter only AFTER merging has chosen the newest entry. Advancing the
+        // merge also consumes older copies, so a deleted key cannot reappear.
+        // Example raw stream: [b:delete, c:delete, d:4]. Keep stepping until d,
+        // unless the upper bound ends the scan first. This needs a loop, not if.
         while self.is_valid() && self.inner.value().is_empty() {
             self.next_inner()?;
         }
@@ -93,6 +110,8 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        // One user-visible step may advance several raw entries: consume the
+        // current key, then skip any consecutive deleted keys that follow it.
         self.next_inner()?;
         self.move_to_non_delete()?;
         Ok(())
@@ -127,6 +146,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
+        // Even if a child still reports a position, an earlier error taints it.
         !self.has_errored && self.iter.is_valid()
     }
 
@@ -145,10 +165,13 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn next(&mut self) -> Result<()> {
-        // only move when the iterator is valid and not errored
+        // An I/O failure can leave children partially advanced. Make the error
+        // permanent rather than exposing a possibly inconsistent merged result.
         if self.has_errored {
             bail!("the iterator is tainted");
         }
+        // Normal exhaustion is different from failure: after reaching the end,
+        // repeated next() calls return Ok(()) without touching the inner cursor.
         if self.iter.is_valid()
             && let Err(e) = self.iter.next()
         {

@@ -132,6 +132,9 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
         compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
+        // Execution is independent of scheduling policy: consume a sorted stream
+        // whose merge has already resolved duplicate keys, then write new SSTs.
+        // Compaction changes the physical layout while preserving logical reads.
         let mut builder = None;
         let mut entries_in_builder: usize = 0;
         let mut new_sst = Vec::new();
@@ -142,6 +145,8 @@ impl LsmStorageInner {
             }
             let builder_inner = builder.as_mut().unwrap();
             if compact_to_bottom_level {
+                // Only at the bottom can a deletion disappear: there is no older
+                // value below this output for it to hide. Otherwise keep it.
                 if !iter.value().is_empty() {
                     builder_inner.add(iter.key(), iter.value());
                     entries_in_builder += 1;
@@ -169,6 +174,8 @@ impl LsmStorageInner {
         if let Some(builder) = builder
             && entries_in_builder > 0
         {
+            // A compaction containing only removable tombstones can produce ZERO
+            // SSTs. Never finalize an empty block just to create an output file.
             let sst_id = self.next_sst_id(); // lock dropped here
             let sst = Arc::new(builder.build(
                 sst_id,
@@ -181,6 +188,9 @@ impl LsmStorageInner {
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        // The controller chose file ids; this function chooses the cursor tree.
+        // Overlapping L0 files require a merge. Each non-overlapping level/tier
+        // can be concatenated. The newer input stays on the left of a two-way merge.
         let snapshot = {
             let state = self.state.read();
             state.clone()
@@ -273,6 +283,9 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
+        // Capture selected L0/L1 ids, build output without the state lock, then
+        // install it against the CURRENT layout. New L0 files flushed meanwhile
+        // must survive; deleting every current L0 file would lose those writes.
         let CompactionOptions::NoCompaction = self.options.compaction_options else {
             panic!("full compaction can only be called with compaction is not enabled")
         };
@@ -333,6 +346,9 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
+        // Three phases: plan on a snapshot, do expensive SST I/O, then install on
+        // the latest state under state_lock. The task names precisely which inputs
+        // to replace; it is not permission to replace the whole old snapshot.
         let snapshot = {
             let state = self.state.read();
             state.clone()
@@ -348,6 +364,9 @@ impl LsmStorageInner {
         let sstables = self.compact(&task)?;
         let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         let ssts_to_remove = {
+            // Add output objects before applying a leveled result, because sorting
+            // its new file list needs their first keys. Sync output directory
+            // entries and the manifest before deleting obsolete input files.
             let state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
             let mut new_sst_ids = Vec::new();
@@ -416,6 +435,9 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        // Rotation and flushing use different triggers: writes freeze a full
+        // current map; this worker drains old immutable maps when their count is
+        // high enough. One tick flushes one oldest map, not the entire backlog.
         let res = {
             let state = self.state.read();
             state.imm_memtables.len() >= self.options.num_memtable_limit

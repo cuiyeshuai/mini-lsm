@@ -98,6 +98,8 @@ impl Bloom {
 
     /// Build bloom filter from key hashes
     pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
+        // Each key sets k positions. Repeated additions only set existing bits;
+        // they cannot erase another key. h + i*delta simulates multiple probes.
         let k = (bits_per_key as f64 * 0.69) as u32;
         let k = k.clamp(1, 30);
         let nbits = (keys.len() * bits_per_key).max(64);
@@ -122,6 +124,8 @@ impl Bloom {
 
     /// Check if a bloom filter may contain some data
     pub fn may_contain(&self, mut h: u32) -> bool {
+        // A single unset bit proves absence. All bits set only means "possible":
+        // other keys may have set the same positions, so get must still seek.
         if self.k > 30 {
             // potential new encoding for short bloom filters
             true

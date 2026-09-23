@@ -51,6 +51,8 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 impl MemTable {
     /// Create a new mem-table.
     pub fn create(id: usize) -> Self {
+        // Week 1 day 1: the skipmap keeps user keys sorted and supports interior
+        // mutation, so put() only needs &self. The Arc lets scan cursors retain it.
         Self {
             id,
             map: Arc::new(SkipMap::new()),
@@ -99,7 +101,8 @@ impl MemTable {
         self.scan(lower, upper)
     }
 
-    /// Get a value by key.
+    /// Get the raw stored value: None means absent here, while Some(empty) is a
+    /// tombstone. The storage layer decides whether to consult older sources.
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         self.map.get(key).map(|e| e.value().clone())
     }
@@ -110,6 +113,10 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // This non-MVCC map stores one entry per user key: putting a second value
+        // replaces the first. An empty value keeps a deletion marker in the map.
+        // approximate_size counts bytes submitted, including overwrites; it is a
+        // freeze trigger estimate, not an exact measurement of current live data.
         let estimated_size = key.len() + value.len();
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
@@ -135,19 +142,26 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        // The skipmap enforces both bounds. Own the bounds and keep the map alive
+        // through an Arc so the returned cursor can outlive this call.
         let (lower, upper) = (map_bound(lower), map_bound(upper));
+        // The generated builder first stores map, then constructs an iterator
+        // borrowing that stored map. item owns the currently exposed key/value.
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
             iter_builder: |map| map.range((lower, upper)),
             item: (Bytes::new(), Bytes::new()),
         }
         .build();
+        // Prime the cursor: item starts empty, but callers expect the first entry.
         iter.next().unwrap();
         iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        // Frozen memory is already sorted. Copy every entry, including tombstones,
+        // into the SST builder: old disk values still need those deletion markers.
         for entry in self.map.iter() {
             builder.add(KeySlice::from_slice(&entry.key()[..]), &entry.value()[..]);
         }
@@ -208,10 +222,13 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn is_valid(&self) -> bool {
+        // Empty keys mark exhaustion; empty values mark deletions and remain valid.
         !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
+        // Clone Bytes handles out of the skipmap entry into item (no byte-buffer
+        // copy). On exhaustion entry_to_item supplies an empty key/value pair.
         let entry = self.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
         self.with_mut(|x| *x.item = entry);
         Ok(())

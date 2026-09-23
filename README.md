@@ -1,6 +1,13 @@
 ![Mini-LSM: Learn database internals by building an LSM storage engine in Rust](./mini-lsm-book/src/mini-lsm-banner.svg)
 
-# Mini-LSM: Build a Database Storage Engine in Rust
+# Mini-LSM — Yeshuai Cui's Annotated Learning Fork
+
+Maintained by [Yeshuai Cui (@cuiyeshuai)](https://github.com/cuiyeshuai), this fork adds
+annotated source code and task-by-task reading guides for all three weeks of
+[Alex Chi's Mini-LSM course](https://github.com/skyzh/mini-lsm). Original attribution
+and licenses are preserved.
+
+**[Start with the annotated code roadmap](READING_ROADMAP.md)** · **[Read-path walkthrough](READ_PATH.md)**
 
 [![CI (main)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml)
 
@@ -9,6 +16,9 @@ Mini-LSM is a hands-on course in database internals for systems and backend engi
 **[Start the guided three-week course](https://skyzh.github.io/mini-lsm)** · **[Try the coding-agent track](https://skyzh.github.io/mini-lsm/agent-fast-forward-overview.html)**
 
 Week 1 produces a working storage engine. Weeks 2 and 3 add production-inspired compaction, durability, concurrency control, and multi-version transactions.
+
+For a guided reading of the reference code, use the [annotated code roadmap](READING_ROADMAP.md),
+or start with the [read-path walkthrough](READ_PATH.md). These guides link directly to annotated functions and chapter tests.
 
 ## What You Will Build
 

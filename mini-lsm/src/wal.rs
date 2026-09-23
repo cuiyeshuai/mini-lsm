@@ -44,6 +44,9 @@ impl Wal {
     }
 
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+        // Replay records in append order, so a later put/delete replaces the same
+        // key's earlier value. Check the complete record BEFORE inserting it.
+        // Truncate an incomplete tail; reject a fully present record with bad CRC.
         let path = path.as_ref();
         let mut file = OpenOptions::new()
             .read(true)
@@ -110,6 +113,9 @@ impl Wal {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Record = key_len:u16 | key | value_len:u16 | value | CRC:u32.
+        // CRC covers the encoded lengths as well as payloads. One successful
+        // append only reaches BufWriter here; sync() establishes durable storage.
         let key_len = u16::try_from(key.len()).context("WAL key is too large")?;
         let value_len = u16::try_from(value.len()).context("WAL value is too large")?;
         let mut file = self.file.lock();
@@ -137,6 +143,8 @@ impl Wal {
     }
 
     pub fn sync(&self) -> Result<()> {
+        // flush() moves bytes out of the userspace buffer; sync_all() asks the OS
+        // to persist the file. Those are separate steps with different guarantees.
         let mut file = self.file.lock();
         file.flush()?;
         file.get_mut().sync_all()?;

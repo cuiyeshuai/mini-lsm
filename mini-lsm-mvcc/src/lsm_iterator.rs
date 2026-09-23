@@ -78,7 +78,14 @@ impl LsmIterator {
     }
 
     fn move_to_key(&mut self) -> Result<()> {
+        // Three distinct operations: skip versions of the already-resolved user
+        // key, skip too-new versions of a new key, then choose its first visible
+        // entry. If that entry is a tombstone, suppress the whole user key.
+        // Example at read_ts=6: a@9=new, a@4=old -> expose old. If a@4=delete,
+        // expose no a, even if a@1 contains a value. At read_ts=10, expose new.
         loop {
+            // prev_key records a resolved user key, including a visible deletion.
+            // It prevents older versions from appearing on a later next() call.
             while self.inner.is_valid() && self.inner.key().key_ref() == self.prev_key {
                 self.next_inner()?;
             }
@@ -91,17 +98,23 @@ impl LsmIterator {
                 && self.inner.key().key_ref() == self.prev_key
                 && self.inner.key().ts() > self.read_ts
             {
+                // A too-new version says nothing about this snapshot's value;
+                // continue within the same key until finding a visible version.
                 self.next_inner()?;
             }
             if !self.inner.is_valid() {
                 break;
             }
             if self.inner.key().key_ref() != self.prev_key {
+                // Every version of the previous key was newer than our snapshot.
+                // Start the visibility search for this next user key instead.
                 continue;
             }
             if !self.inner.value().is_empty() {
                 break;
             }
+            // The first visible version is deleted. Loop back with prev_key kept
+            // so the initial loop consumes all older versions of this user key.
         }
         Ok(())
     }

@@ -42,6 +42,9 @@ use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
 /// Represents the state of the storage engine.
+/// Reads clone the Arc containing this layout, keeping one consistent set of
+/// sources while flush/compaction publishes a replacement. The mutable memtable
+/// is still shared and writable: this is not an MVCC snapshot of key/value data.
 #[derive(Clone)]
 pub struct LsmStorageState {
     /// The current memtable.
@@ -50,10 +53,11 @@ pub struct LsmStorageState {
     pub imm_memtables: Vec<Arc<MemTable>>,
     /// L0 SSTs, from latest to earliest.
     pub l0_sstables: Vec<usize>,
-    /// SsTables sorted by key range; L1 - L_max for leveled compaction, or tiers for tiered
-    /// compaction.
+    /// L1 - L_max for leveled compaction, or newest-to-oldest tiers for tiered
+    /// compaction. Within each level/tier, SSTs have sorted, non-overlapping key ranges.
     pub levels: Vec<(usize, Vec<usize>)>,
-    /// SST objects.
+    /// ID-to-object lookup. The ordered vectors above determine priority, not
+    /// this HashMap's iteration order. IDs do not directly encode read precedence.
     pub sstables: HashMap<usize, Arc<SsTable>>,
 }
 
@@ -149,12 +153,16 @@ impl LsmStorageOptions {
     }
 }
 
+// Test the query bounds against an SST's inclusive [first_key, last_key] range.
+// This can skip a whole table before loading any of its data blocks.
 fn range_overlap(
     user_begin: Bound<&[u8]>,
     user_end: Bound<&[u8]>,
     table_begin: KeySlice,
     table_end: KeySlice,
 ) -> bool {
+    // Reject ranges completely to the LEFT of this SST. If query upper == the
+    // table's first key, only an included upper bound can overlap at that key.
     match user_end {
         Bound::Excluded(key) if key <= table_begin.raw_ref() => {
             return false;
@@ -164,6 +172,7 @@ fn range_overlap(
         }
         _ => {}
     }
+    // Symmetrically reject ranges completely to the RIGHT of this SST.
     match user_begin {
         Bound::Excluded(key) if key >= table_end.raw_ref() => {
             return false;
@@ -223,6 +232,10 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
+        // Stop and join background workers before the final persistence step.
+        // With WAL, sync is sufficient; without WAL, freeze the current memtable
+        // and drain immutable tables into SSTs. Drop only signals workers, so
+        // explicit close() is the operation to study for graceful persistence.
         self.inner.sync_dir()?;
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
@@ -287,6 +300,9 @@ impl MiniLsm {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // Walkthrough: memory miss -> seek candidate disk sources -> select the
+        // smallest candidate key, preferring newer sources only on equal keys.
+        // get(b) may seek one SST to c and another to b; the merged b must win.
         self.inner.get(key)
     }
 
@@ -344,6 +360,9 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        // Recovery has two passes: replay manifest records to discover the live
+        // file layout, then open only the surviving SSTs and unflushed WALs.
+        // A file left on disk is not automatically part of the live database.
         let mut state = LsmStorageState::create(&options);
         let path = path.as_ref();
         let mut next_sst_id = 1;
@@ -380,6 +399,8 @@ impl LsmStorageInner {
             let (m, records) = Manifest::recover(&manifest_path)?;
             let mut memtables = BTreeSet::new();
             for record in records {
+                // NewMemtable adds a pending WAL id; Flush turns that id into an
+                // SST; Compaction replaces selected SST ids with output ids.
                 match record {
                     ManifestRecord::Flush(sst_id) => {
                         let res = memtables.remove(&sst_id);
@@ -492,17 +513,21 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    /// Point read: probe memory first, then seek and merge candidate SSTs.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // 1. Clone the layout under a short lock. All subsequent SST seeks and
+        // possible disk reads happen after the guard is dropped.
         let snapshot = {
             let guard = self.state.read();
+            // Increment an Arc reference count; do not copy maps, tables, or data.
             Arc::clone(&guard)
         }; // drop global lock here
 
-        // Search on the current memtable.
+        // 2. Search memory in precedence order: current, then newest immutable
+        // through oldest. The first occurrence is authoritative, even a deletion.
         if let Some(value) = snapshot.memtable.get(key) {
             if value.is_empty() {
-                // found tomestone, return key not exists
+                // A tombstone ends the lookup; older sources may still have a value.
                 return Ok(None);
             }
             return Ok(Some(value));
@@ -512,7 +537,7 @@ impl LsmStorageInner {
         for memtable in snapshot.imm_memtables.iter() {
             if let Some(value) = memtable.get(key) {
                 if value.is_empty() {
-                    // found tomestone, return key not exists
+                    // Stop here too, so an older value cannot resurrect this key.
                     return Ok(None);
                 }
                 return Ok(Some(value));
@@ -522,6 +547,9 @@ impl LsmStorageInner {
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
 
         let keep_table = |key: &[u8], table: &SsTable| {
+            // 3. Prune impossible SSTs using metadata already in memory. A Bloom
+            // negative rules the key out; a positive still requires an exact seek
+            // result check because the filter can have false positives.
             if key_within(
                 key,
                 table.first_key().as_key_slice(),
@@ -538,6 +566,8 @@ impl LsmStorageInner {
             false
         };
 
+        // L0 tables overlap. Preserve newest-to-oldest order so the merge's
+        // smaller-input-index rule selects the newest copy of a duplicate key.
         for table in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table].clone();
             if keep_table(key, &table) {
@@ -548,6 +578,8 @@ impl LsmStorageInner {
             }
         }
         let l0_iter = MergeIterator::create(l0_iters);
+        // Week 2 extension: concatenate disjoint SSTs within each level/tier,
+        // then merge across levels/tiers, whose key ranges can overlap.
         let mut level_iters = Vec::with_capacity(snapshot.levels.len());
         for (_, level_sst_ids) in &snapshot.levels {
             let mut level_ssts = Vec::with_capacity(level_sst_ids.len());
@@ -564,7 +596,13 @@ impl LsmStorageInner {
 
         let iter = TwoMergeIterator::create(l0_iter, MergeIterator::create(level_iters))?;
 
+        // 4. Seek means "first key >= target", not "found target". Return only an
+        // exact, live match. A winning SST tombstone also ends the search.
+        // Short-circuiting protects key()/value() when the cursor is invalid.
+        // If all candidates landed after key, this condition returns None.
         if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
+            // The cursor owns the block containing this borrowed value. Copy the
+            // bytes so the returned result stays valid after the cursor is dropped.
             return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
         Ok(None)
@@ -572,6 +610,9 @@ impl LsmStorageInner {
 
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         validate_write_batch(batch)?;
+        // Week 2 batches share an API, but apply records one at a time. They can
+        // freeze between entries and are not atomic transactions. Week 3 adds a
+        // shared commit timestamp and a single WAL frame for atomic publication.
         for record in batch {
             match record {
                 WriteBatchRecord::Del(key) => {
@@ -614,6 +655,9 @@ impl LsmStorageInner {
     }
 
     fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        // The first size check avoids taking the structural lock for small writes.
+        // Check again after locking: another writer may already have frozen the
+        // full memtable. Drop the read guard before acquiring the write guard.
         if estimated_size >= self.options.target_sst_size {
             let state_lock = self.state_lock.lock();
             let guard = self.state.read();
@@ -648,6 +692,9 @@ impl LsmStorageInner {
     }
 
     fn freeze_memtable_with_memtable(&self, memtable: Arc<MemTable>) -> Result<()> {
+        // Freeze changes ownership in the layout; it does not write an SST.
+        // Readers see either layout, and both retain the old map through an Arc.
+        // Insert at index 0 to preserve newest-to-oldest immutable-table priority.
         let mut guard = self.state.write();
         // Swap the current memtable with a new one.
         let mut snapshot = guard.as_ref().clone();
@@ -665,6 +712,9 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        // Create the replacement (and its WAL), record NewMemtable, then publish
+        // the swap. The MutexGuard argument documents the structural lock held
+        // across this sequence, beyond the short state RwLock critical section.
         let memtable_id = self.next_sst_id();
         let memtable = if self.options.enable_wal {
             Arc::new(MemTable::create_with_wal(
@@ -690,6 +740,10 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
+        // Flush the OLDEST immutable table, but install its SST as NEWEST in L0:
+        // newer memory remains above it. Build and sync the file before replacing
+        // its memory source; record Flush before removing the corresponding WAL.
+        // A concurrent reader retains its old memtable or sees the replacement SST.
         let state_lock = self.state_lock.lock();
 
         let flush_memtable = {
@@ -756,18 +810,30 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
+        // A scan constructs a tree of cursors, not a Vec of all matching entries.
+        // Setup seeks each source to its first candidate (which may load blocks).
+        // The caller's next() drives further merging and block reads on demand.
+        // 1. Pin the source layout, then release the lock before building cursors.
+        // Their Arcs retain the underlying maps/tables as the scan progresses.
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         }; // drop global lock here
 
+        // 2. Build bounded memory cursors. Input order is part of correctness:
+        // current memtable wins ties, then immutable memtables newest to oldest.
         let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
         memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
         for memtable in snapshot.imm_memtables.iter() {
             memtable_iters.push(Box::new(memtable.scan(lower, upper)));
         }
         let memtable_iter = MergeIterator::create(memtable_iters);
+        // Example: current=[b:delete,d:4], immutable=[a:1,b:2] produces the
+        // raw memory stream [a:1,b:delete,d:4]. The deletion must survive for now.
 
+        // 3. Build one cursor per overlapping L0 table, again newest first.
+        // Range scans use min/max keys for pruning; a point Bloom lookup cannot
+        // tell whether a table contains any key in an arbitrary range.
         let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
@@ -782,6 +848,9 @@ impl LsmStorageInner {
                         SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
                     }
                     Bound::Excluded(key) => {
+                        // Seek lands at >= key. For an exclusive lower bound,
+                        // advance once only if it landed exactly on the boundary.
+                        // Excluding b: seek->b means advance; seek->c means keep c.
                         let mut iter = SsTableIterator::create_and_seek_to_key(
                             table,
                             KeySlice::from_slice(key),
@@ -799,6 +868,8 @@ impl LsmStorageInner {
         }
 
         let l0_iter = MergeIterator::create(table_iters);
+        // 4. Week 2 extension: a level/tier is one sorted, disjoint run of SSTs.
+        // Concatenate within each run; merge the runs in their precedence order.
         let mut level_iters = Vec::with_capacity(snapshot.levels.len());
         for (_, level_sst_ids) in &snapshot.levels {
             let mut level_ssts = Vec::with_capacity(level_sst_ids.len());
@@ -834,9 +905,15 @@ impl LsmStorageInner {
             level_iters.push(Box::new(level_iter));
         }
 
+        // 5. Left input wins ties: memory > L0 > levels/tiers. Keep tombstones
+        // through these merges so they suppress older copies of the same key.
         let iter = TwoMergeIterator::create(memtable_iter, l0_iter)?;
         let iter = TwoMergeIterator::create(iter, MergeIterator::create(level_iters))?;
 
+        // 6. LsmIterator enforces the upper bound and hides winning tombstones.
+        // FusedIterator makes exhaustion harmless and iteration errors permanent.
+        // map_bound copies upper into owned Bytes; the returned iterator must not
+        // borrow the caller's temporary bound. new() also prepares the first live key.
         Ok(FusedIterator::new(LsmIterator::new(
             iter,
             map_bound(upper),

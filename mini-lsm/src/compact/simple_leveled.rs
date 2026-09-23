@@ -51,6 +51,10 @@ impl SimpleLeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
+        // Policy only: count files, check the L0 trigger first, then compare each
+        // adjacent pair of levels. The task merges WHOLE levels in this strategy.
+        // Example: upper=4 files, lower=2 -> lower/upper=50%; a 200% threshold
+        // triggers compaction because the lower level is too small relative to upper.
         if self.options.max_levels == 0 {
             return None;
         }
@@ -111,6 +115,9 @@ impl SimpleLeveledCompactionController {
         task: &SimpleLeveledCompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
+        // Apply against today's state. For L0, remove only ids named in the task:
+        // snapshot L0=[8,7], then flush 9 -> current=[9,8,7]; keep 9 after replacing
+        // 8 and 7. Both its presence and its newest-first position matter to reads.
         let mut snapshot = snapshot.clone();
         let mut files_to_remove = Vec::new();
         if let Some(upper_level) = task.upper_level {

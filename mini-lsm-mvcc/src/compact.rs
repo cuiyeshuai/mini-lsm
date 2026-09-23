@@ -136,6 +136,10 @@ impl LsmStorageInner {
         let mut entries_in_builder: usize = 0;
         let mut new_sst = Vec::new();
         let watermark = self.mvcc().watermark();
+        // Physical rewrite must preserve every active snapshot, not just today's
+        // latest values. Keep all versions > watermark plus the first <= watermark
+        // for each key as its older readers' baseline (subject to deletion/filter rules).
+        // At watermark=6, versions a@9,a@7,a@4,a@1 retain 9,7,4; only 1 is obsolete.
         let mut last_key = Vec::<u8>::new();
         let mut first_key_below_watermark = false;
         let compaction_filters = self.compaction_filters.lock().clone();
@@ -154,6 +158,9 @@ impl LsmStorageInner {
                 && iter.key().ts() <= watermark
                 && iter.value().is_empty()
             {
+                // A newest tombstone already visible to the oldest reader can
+                // vanish at the bottom together with its older history. Above the
+                // bottom it may still need to hide values outside these inputs.
                 last_key.clear();
                 last_key.extend(iter.key().key_ref());
                 iter.next()?;
@@ -162,6 +169,8 @@ impl LsmStorageInner {
             }
 
             if iter.key().ts() <= watermark {
+                // first_key_below_watermark means "baseline still available".
+                // Consume that allowance once; skip older versions of this key.
                 if !first_key_below_watermark {
                     iter.next()?;
                     continue;
@@ -170,6 +179,11 @@ impl LsmStorageInner {
                 first_key_below_watermark = false;
 
                 if !compaction_filters.is_empty() {
+                    // Filters are applied only in the <=watermark region. Newer
+                    // versions remain because an active snapshot may require them.
+                    // This is a compaction-time policy, not an immediate read filter.
+                    // The course excludes reads inside filtered prefixes from the
+                    // normal snapshot guarantee: this policy explicitly deletes data.
                     for filter in &compaction_filters {
                         match filter {
                             CompactionFilter::Prefix(x) => {
@@ -189,6 +203,9 @@ impl LsmStorageInner {
                 && !same_as_last_key
                 && entries_in_builder > 0
             {
+                // Split output only BETWEEN user keys, even if one key's history
+                // exceeds the target size. Keeping its versions together preserves
+                // disjoint user-key ranges in a level and simplifies future seeks.
                 let sst_id = self.next_sst_id();
                 let old_builder = builder.take().unwrap();
                 let sst = Arc::new(old_builder.build(

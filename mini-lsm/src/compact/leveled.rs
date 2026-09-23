@@ -51,6 +51,9 @@ impl LeveledCompactionController {
         sst_ids: &[usize],
         in_level: usize,
     ) -> Vec<usize> {
+        // Compute the selected input range, then include every lower SST touching
+        // it. If inputs span [b,f], a lower [e,h] overlaps and must participate;
+        // leaving it behind could violate the lower level's disjoint-range rule.
         let begin_key = sst_ids
             .iter()
             .map(|id| snapshot.sstables[id].first_key())
@@ -80,6 +83,9 @@ impl LeveledCompactionController {
         snapshot: &LsmStorageState,
     ) -> Option<LeveledCompactionTask> {
         // step 1: compute target level size
+        // Dynamic targets grow backward from the bottom using byte sizes, unlike
+        // simple compaction's file counts. Zero-target shallow levels stay empty;
+        // base_level is where L0 output should enter the leveled part of the tree.
         let mut target_level_size = (0..self.options.max_levels).map(|_| 0).collect::<Vec<_>>(); // exclude level 0
         let mut real_level_size = Vec::with_capacity(self.options.max_levels);
         let mut base_level = self.options.max_levels;
@@ -125,6 +131,8 @@ impl LeveledCompactionController {
         }
 
         let mut priorities = Vec::with_capacity(self.options.max_levels);
+        // actual/target > 1 identifies an oversized level; highest ratio wins.
+        // L0's file-count trigger was checked first because its files overlap.
         for level in 0..self.options.max_levels {
             let prio = real_level_size[level] as f64 / target_level_size[level] as f64;
             if prio > 1.0 {
@@ -175,6 +183,9 @@ impl LeveledCompactionController {
         output: &[usize],
         in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
+        // Remove selected ids, retain untouched SSTs, then add outputs and restore
+        // key-range order. During recovery, objects are not loaded yet, so sorting
+        // is deferred until open() can inspect the tables' actual first keys.
         let mut snapshot = snapshot.clone();
         let mut files_to_remove = Vec::new();
         let mut upper_level_sst_ids_set = task

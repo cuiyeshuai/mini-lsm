@@ -46,6 +46,9 @@ impl TieredCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<TieredCompactionTask> {
+        // Tiers are newest-first sorted runs; flush creates a tier rather than L0.
+        // Consider triggers in order: enough runs -> space amplification -> size
+        // ratio -> fallback run-count reduction. Here run size is a file count.
         assert!(
             snapshot.l0_sstables.is_empty(),
             "should not add l0 ssts in tiered compaction"
@@ -59,6 +62,8 @@ impl TieredCompactionController {
             size += snapshot.levels[id].1.len();
         }
         let space_amp_ratio =
+            // Estimate extra space as all newer tiers divided by the oldest tier.
+            // For tier sizes [2,3,5], that is (2+3)/5*100 = 100%.
             (size as f64) / (snapshot.levels.last().unwrap().1.len() as f64) * 100.0;
         if space_amp_ratio >= self.options.max_size_amplification_percent as f64 {
             println!(
@@ -71,6 +76,9 @@ impl TieredCompactionController {
             });
         }
         let size_ratio_trigger = (100.0 + self.options.size_ratio as f64) / 100.0;
+        // This implementation merges a prefix of newer runs when the next older
+        // run is sufficiently larger than their accumulated size. Read the exact
+        // ratio direction; reversing it selects a different compaction policy.
         // compaction triggered by size ratio
         let mut size = 0;
         for id in 0..(snapshot.levels.len() - 1) {
@@ -118,6 +126,9 @@ impl TieredCompactionController {
         task: &TieredCompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
+        // Preserve unselected tiers and their order, including a tier flushed
+        // after planning. Insert the replacement at the selected tiers' position.
+        // Empty output is valid when bottom compaction removes all entries.
         assert!(
             snapshot.l0_sstables.is_empty(),
             "should not add l0 ssts in tiered compaction"

@@ -63,6 +63,9 @@ impl BlockBuilder {
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
+        // Week 3 format change: compress only the USER-key bytes and always store
+        // an explicit u64 timestamp after the suffix. Two versions of "apple"
+        // can have an empty suffix yet still differ by timestamp.
         assert!(!key.is_empty(), "key must not be empty");
         let Ok(key_len) = u16::try_from(key.key_len()) else {
             return false;

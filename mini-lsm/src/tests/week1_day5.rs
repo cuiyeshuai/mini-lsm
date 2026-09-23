@@ -144,6 +144,10 @@ fn test_task1_merge_5() {
 
 #[test]
 fn test_task2_storage_scan() {
+    // Read-path walkthrough: freezing puts [00,1,2] in an immutable memtable.
+    // The new current memtable deletes 1 and adds 3. Later, L0's older value for
+    // 00 loses to memory, and the newer L0 tombstone for 4 hides its older value.
+    // Predict the full scan's keys before reading the assertions: [0,00,2,3].
     let dir = tempdir().unwrap();
     let storage =
         Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
@@ -220,6 +224,8 @@ fn test_task2_storage_scan() {
 
 #[test]
 fn test_task2_storage_scan_end_bound_at_seek_position() {
+    // Seeking key01 lands on key11. LsmIterator::new must check the upper bound
+    // before the caller reads anything; next() alone cannot enforce this case.
     let dir = tempdir().unwrap();
     let storage =
         Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());
@@ -261,6 +267,9 @@ fn test_task2_storage_scan_end_bound_at_seek_position() {
 
 #[test]
 fn test_task3_storage_get() {
+    // Trace each assertion back to a source: 0 and 10 come from the older SST;
+    // 00 and 2 come from immutable memory; 3 comes from current memory; 4 is
+    // hidden by the newer SST's tombstone. -- and 555 miss every source.
     let dir = tempdir().unwrap();
     let storage =
         Arc::new(LsmStorageInner::open(&dir, LsmStorageOptions::default_for_week1_test()).unwrap());

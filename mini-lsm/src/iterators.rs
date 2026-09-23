@@ -16,6 +16,9 @@ pub mod concat_iterator;
 pub mod merge_iterator;
 pub mod two_merge_iterator;
 
+/// A cursor over sorted entries: check `is_valid()`, read `key()` / `value()`, then
+/// call `next()`. Read-path constructors seek to the first candidate before returning.
+/// An empty value can be a valid tombstone; validity is about the cursor position.
 pub trait StorageIterator {
     type KeyType<'a>: PartialEq + Eq + PartialOrd + Ord
     where

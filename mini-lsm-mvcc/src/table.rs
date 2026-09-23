@@ -114,6 +114,9 @@ impl BlockMeta {
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: &[u8]) -> Result<(Vec<BlockMeta>, u64)> {
+        // Read timestamped first/last keys plus the table-wide maximum timestamp.
+        // Recovery needs that maximum even when the newest commit is already
+        // flushed and its WAL has been removed.
         let trailer_size = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
         ensure!(
             buf.len() >= std::mem::size_of::<u32>() + trailer_size,

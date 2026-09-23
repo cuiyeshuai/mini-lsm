@@ -116,6 +116,9 @@ impl BlockIterator {
     /// Seek to the specified position and update the current `key` and `value`
     /// Index update will be handled by caller
     fn seek_to_offset(&mut self, offset: usize) {
+        // Reconstruct the user-key prefix/suffix, then decode the timestamp into
+        // KeyVec. Binary search must compare that complete internal key, while
+        // the public LSM iterator later strips the timestamp from its output.
         let mut entry = &self.block.data[offset..];
         // Since `get_u16()` will automatically move the ptr 2 bytes ahead here,
         // we don't need to manually advance it

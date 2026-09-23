@@ -18,9 +18,14 @@ use super::StorageIterator;
 
 /// Merges two iterators of different types into one. If the two iterators have the same key, only
 /// produce the key once and prefer the entry from A.
+///
+/// Read-path example: A is merged memory, B is merged L0. Both children are
+/// sorted and already unique by key. We store two cursors, not a combined array;
+/// key()/value() borrow the current winner and next() advances the merge lazily.
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
+    // Cached selection for key(), value(), and is_valid(); not a recency flag.
     choose_a: bool,
 }
 
@@ -30,16 +35,28 @@ impl<
 > TwoMergeIterator<A, B>
 {
     fn choose_a(a: &A, b: &B) -> bool {
+        // Exhausted A selects B (even if B is also exhausted, making us invalid).
+        // Otherwise, exhausted B selects A. Only compare keys when both are valid.
         if !a.is_valid() {
             return false;
         }
         if !b.is_valid() {
             return true;
         }
+        // `skip_b` has already removed a tie, so a strict comparison is enough.
         a.key() < b.key()
     }
 
     fn skip_b(&mut self) -> Result<()> {
+        // General duplicate rule: when both cursors have the same key, keep A's
+        // entry and advance B past its copy. The caller gives A higher priority
+        // by placing it first; this function does not inspect either value.
+        // Example: A=[b:9,d:4], B=[b:2,c:3]. Advance B to c and expose A's b:9.
+        // The full output is [b:9,c:3,d:4], with b emitted only once.
+        // Each child already emits unique keys, so one step removes the duplicate.
+        // A deletion follows exactly the same rule: if A's b holds a tombstone,
+        // retain it here and discard B's b. LsmIterator later hides the tombstone
+        // after merging has suppressed the older entry.
         if self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
             self.b.next()?;
         }
@@ -47,11 +64,14 @@ impl<
     }
 
     pub fn create(a: A, b: B) -> Result<Self> {
+        // A and B may be different concrete types, but must expose the same key
+        // type for comparison (the for<'a> bound above applies to every borrow).
         let mut iter = Self {
             choose_a: false,
             a,
             b,
         };
+        // Normalize the initial position too; callers can read before calling next.
         iter.skip_b()?;
         iter.choose_a = Self::choose_a(&iter.a, &iter.b);
         Ok(iter)
@@ -90,6 +110,10 @@ impl<
     }
 
     fn next(&mut self) -> Result<()> {
+        // Advance only the child that supplied the current output, then resolve
+        // any new tie before exposing the next smallest key.
+        // Continuing skip_b's example: A moves b->d; B stays at c, so B wins.
+        // On the following call B moves past c; A's d becomes the next output.
         if self.choose_a {
             self.a.next()?;
         } else {

@@ -122,18 +122,25 @@ impl BlockIterator {
         let key_len = entry.get_u16() as usize;
         let key = &entry[..key_len];
         self.key.clear();
+        // Prefix compression uses the block's FIRST key, not the previous entry.
+        // That lets binary search decode any entry without visiting earlier ones.
+        // First key "apple", overlap=4, suffix="y" reconstructs "apply".
         self.key.append(&self.first_key.raw_ref()[..overlap_len]);
         self.key.append(key);
         entry.advance(key_len);
         let value_len = entry.get_u16() as usize;
         let value_offset_begin = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
         let value_offset_end = value_offset_begin + value_len;
+        // Keep offsets into the shared block instead of allocating a value copy.
+        // value() later borrows this slice; a zero-length slice is a tombstone.
         self.value_range = (value_offset_begin, value_offset_end);
         entry.advance(value_len);
     }
 
     /// Seek to the first key that is >= `key`.
     pub fn seek_to_key(&mut self, key: KeySlice) {
+        // Binary-search entry indexes; offsets let seek_to jump directly to each
+        // encoded entry. An absent target can land on a larger key or exhaustion.
         let mut low = 0;
         let mut high = self.block.offsets.len();
         while low < high {
@@ -146,6 +153,8 @@ impl BlockIterator {
                 std::cmp::Ordering::Equal => return,
             }
         }
+        // No exact match: low is the insertion position (the first greater key).
+        // If low == entry count, seek_to marks this cursor invalid.
         self.seek_to(low);
     }
 }

@@ -69,6 +69,10 @@ pub(crate) fn map_key_bound_plus_ts<'a>(
     upper: Bound<&'a [u8]>,
     ts: u64,
 ) -> (Bound<KeySlice<'a>>, Bound<KeySlice<'a>>) {
+    // User bounds describe ALL versions of a boundary key. Because ts descends:
+    // lower Included(a) starts at a@read_ts; lower Excluded(a) starts after a@0.
+    // upper Included(z) ends at z@0; upper Excluded(z) ends before z@MAX.
+    // Applying the same timestamp to every bound would leak or omit boundary keys.
     (
         match lower {
             Bound::Included(x) => Bound::Included(KeySlice::from_slice_with_ts(x, ts)),
@@ -159,6 +163,9 @@ impl MemTable {
 
     /// Implement this in week 3, day 5.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        // Append one complete WAL frame before mutating the map. Entries then
+        // become physically present one by one, but readers cannot see the new
+        // timestamp until write_batch_inner publishes it after this call returns.
         if let Some(ref wal) = self.wal {
             wal.put_batch(data)?;
         }
@@ -185,6 +192,9 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<KeySlice>, upper: Bound<KeySlice>) -> MemTableIterator {
+        // This cursor exposes raw versions, not one logical value per user key.
+        // A range for a@MAX through a@0 includes every stored version of a;
+        // LsmIterator applies read_ts after merging versions from all sources.
         let (lower, upper) = (map_key_bound(lower), map_key_bound(upper));
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),

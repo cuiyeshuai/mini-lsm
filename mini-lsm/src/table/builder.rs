@@ -51,6 +51,8 @@ impl SsTableBuilder {
 
     /// Adds a key-value pair to SSTable
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        // Caller supplies sorted keys. first_key/last_key describe the CURRENT
+        // block, while meta accumulates bounds and offsets for finished blocks.
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }
@@ -66,6 +68,8 @@ impl SsTableBuilder {
         self.finish_block();
 
         // add the key-value pair to the next block
+        // The rejected entry was not consumed. Retry that same pair in a fresh
+        // block, then reset both boundary keys to this new block's first entry.
         assert!(self.builder.add(key, value));
         self.first_key.set_from_slice(key);
         self.last_key.set_from_slice(key);
@@ -77,6 +81,9 @@ impl SsTableBuilder {
     }
 
     fn finish_block(&mut self) {
+        // Swap out the builder so build() can consume it. Capture its boundaries
+        // before resetting them; using the next entry's key would corrupt the index.
+        // Each block is followed by its own CRC, so one cached read can verify it.
         let builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let encoded_block = builder.build().encode();
         self.meta.push(BlockMeta {
@@ -96,6 +103,9 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
+        // Finish the pending block, then append metadata and a Bloom filter.
+        // Layout: (block + CRC)* | metadata | meta_offset:u32 | bloom | bloom_offset:u32.
+        // SsTable::open walks backward through these trailers to load the indexes.
         self.finish_block();
         let mut buf = self.data;
         let meta_offset = buf.len();

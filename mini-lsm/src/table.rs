@@ -61,6 +61,8 @@ pub struct BlockMeta {
 impl BlockMeta {
     /// Encode block meta to a buffer.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) -> Result<()> {
+        // Metadata is the in-memory search index after open(): block offset plus
+        // first/last keys. Its checksum covers the entries after the count field.
         let mut estimated_size = std::mem::size_of::<u32>();
         for meta in block_meta {
             // The size of offset
@@ -94,6 +96,8 @@ impl BlockMeta {
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: &[u8]) -> Result<Vec<BlockMeta>> {
+        // Check CRC and field lengths before trusting offsets or allocating keys.
+        // The count must fit the available bytes even if a corrupt file claims more.
         ensure!(
             buf.len() >= std::mem::size_of::<u32>() * 2,
             "SST block metadata is truncated"
@@ -212,6 +216,9 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+        // Open loads indexes, not every data block. The last u32 locates the Bloom
+        // filter; the u32 just before that filter locates the block metadata.
+        // Data blocks are read later through read_block_cached when a cursor seeks.
         let len = file.size();
         let bloom_trailer_offset = len
             .checked_sub(std::mem::size_of::<u32>() as u64)
@@ -301,6 +308,9 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
+        // Block i occupies [its offset, the next block's offset). For the last
+        // block, metadata begins immediately after it. This range includes the
+        // trailing 4-byte checksum, which is removed before decoding the block.
         let offset = self
             .block_meta
             .get(block_idx)
@@ -332,6 +342,8 @@ impl SsTable {
 
     /// Read a block from disk, with block cache.
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
+        // Cache decoded blocks by (SST id, block index). A hit reuses the Arc;
+        // a miss reads bytes, checks the checksum, and decodes via read_block().
         if let Some(ref block_cache) = self.block_cache {
             let blk = block_cache
                 .try_get_with((self.id, block_idx), || self.read_block(block_idx))
@@ -344,6 +356,11 @@ impl SsTable {
 
     /// Find the block that may contain `key`.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
+        // Choose the last block whose first key <= target, or block 0 if the
+        // target precedes the table. This selects a candidate, not an exact match.
+        // For first keys [a,m,z] and target n, partition_point returns 2 (the
+        // first false predicate); subtract 1 to choose the block starting at m.
+        // saturating_sub keeps a target before a from underflowing below zero.
         self.block_meta
             .partition_point(|meta| meta.first_key.as_key_slice() <= key)
             .saturating_sub(1)

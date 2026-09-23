@@ -16,6 +16,8 @@ use std::{cmp::Reverse, fmt::Debug};
 
 use bytes::Bytes;
 
+// Internal identity is (user key, commit timestamp). Merges deduplicate identical
+// internal keys; selecting ONE visible version per user key happens later.
 pub struct Key<T: AsRef<[u8]>>(T, u64);
 
 pub type KeySlice<'a> = Key<&'a [u8]>;
@@ -31,6 +33,8 @@ pub const TS_DEFAULT: u64 = 0;
 pub const TS_MAX: u64 = u64::MAX;
 pub const TS_MIN: u64 = u64::MIN;
 pub const TS_RANGE_BEGIN: u64 = u64::MAX;
+// Timestamps sort backward: MAX is the beginning of a user's version range and
+// MIN is its end. These sentinels describe ordering, not real transaction times.
 pub const TS_RANGE_END: u64 = u64::MIN;
 
 impl<T: AsRef<[u8]>> Key<T> {
@@ -214,6 +218,8 @@ impl<T: AsRef<[u8]> + PartialOrd> PartialOrd for Key<T> {
 
 impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // User keys ascending, versions descending: a@9 < a@4 < b@12.
+        // Seeking (a,6) skips a@9 and can land at a@4, the newest version <= 6.
         (self.0.as_ref(), Reverse(self.1)).cmp(&(other.0.as_ref(), Reverse(other.1)))
     }
 }

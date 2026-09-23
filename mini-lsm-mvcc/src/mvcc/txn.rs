@@ -46,6 +46,9 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // Record the dependency even for a missing key. Then read your own local
+        // writes first; only a local MISS falls through to the shared snapshot.
+        // A local tombstone is an authoritative result, not a reason to fall through.
         if self.committed.load(Ordering::SeqCst) {
             panic!("cannot operate on committed txn!");
         }
@@ -65,6 +68,9 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        // Merge two user-key streams: private workspace first, snapshot second.
+        // Local updates win equal keys, including deletes. TxnIterator filters
+        // tombstones afterward and retains this transaction through an Arc.
         if self.committed.load(Ordering::SeqCst) {
             panic!("cannot operate on committed txn!");
         }
@@ -86,6 +92,8 @@ impl Transaction {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
+        // Stage the latest value in a timestamp-free private map. No shared
+        // memtable or WAL write happens until commit; repeated puts collapse here.
         if self.committed.load(Ordering::SeqCst) {
             panic!("cannot operate on committed txn!");
         }
@@ -99,6 +107,8 @@ impl Transaction {
     }
 
     pub fn delete(&self, key: &[u8]) {
+        // Keep a local tombstone so both get and scan hide the shared snapshot's
+        // older entry. Removing the local map entry would undo that override.
         if self.committed.load(Ordering::SeqCst) {
             panic!("cannot operate on committed txn!");
         }
@@ -112,6 +122,10 @@ impl Transaction {
     }
 
     pub fn commit(&self) -> Result<()> {
+        // One-shot state transition, then validate -> publish -> record history
+        // under commit_lock. A failed validation consumes this transaction but
+        // publishes none of its staged entries. The course assumes one user thread
+        // operates on a transaction; this flag is not a lock around its workspace.
         self.committed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .expect("cannot operate on committed txn!");
@@ -127,6 +141,9 @@ impl Transaction {
             if !write_set.is_empty() {
                 let committed_txns = self.inner.mvcc().committed_txns.lock();
                 for (_, txn_data) in committed_txns.range((self.read_ts + 1)..) {
+                    // Check our READS against writes committed after our snapshot.
+                    // T1 reads b/writes a; T2 reads a/writes b. Once T1 commits,
+                    // T2's read(a) intersects T1's write(a), so reject T2.
                     for key_hash in read_set {
                         if txn_data.key_hashes.contains(key_hash) {
                             bail!("serializable check failed");
@@ -150,6 +167,7 @@ impl Transaction {
             })
             .collect::<Vec<_>>();
         if batch.is_empty() {
+            // Read-only commit needs no new timestamp, WAL record, or history entry.
             return Ok(());
         }
         let ts = self.inner.write_batch_inner(&batch)?;
@@ -184,6 +202,8 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        // A TxnIterator holds an Arc<Transaction>, so dropping the user's handle
+        // alone cannot release the snapshot while that scan still needs it.
         self.inner.mvcc().ts.lock().1.remove_reader(self.read_ts)
     }
 }
@@ -259,6 +279,8 @@ impl TxnIterator {
     }
 
     fn add_to_read_set(&self, key: &[u8]) {
+        // Only returned keys are tracked. An empty scan contributes no key hashes,
+        // so inserts into gaps (phantoms) are NOT detected by this implementation.
         if let Some(guard) = &self.txn.key_hashes {
             let mut guard = guard.lock();
             let (_, read_set) = &mut *guard;

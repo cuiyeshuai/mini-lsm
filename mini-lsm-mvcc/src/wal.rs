@@ -44,6 +44,9 @@ impl Wal {
     }
 
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
+        // Crash atomicity is per frame: decode into temporary kv_pairs, validate
+        // every field and the complete CRC, then apply the whole batch. A corrupt
+        // frame must not leak its valid-looking prefix into the recovered map.
         let path = path.as_ref();
         let mut file = OpenOptions::new()
             .read(true)
@@ -125,6 +128,9 @@ impl Wal {
 
     /// Implement this in week 3, day 5.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        // Frame = body_bytes:u32 | (key_len,key,ts,value_len,value)* | CRC:u32.
+        // One transaction uses one frame even if it exceeds the memtable target.
+        // A torn final frame is discarded on recovery; earlier frames remain valid.
         let mut file = self.file.lock();
         let mut buf = Vec::<u8>::new();
         for (key, value) in data {

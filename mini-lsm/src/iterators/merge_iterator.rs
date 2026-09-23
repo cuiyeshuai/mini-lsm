@@ -22,6 +22,8 @@ use crate::key::KeySlice;
 
 use super::StorageIterator;
 
+// Tuple fields: original input index (priority), then the child cursor.
+// Preserve the original index even when earlier inputs are empty or filtered out.
 struct HeapWrapper<I: StorageIterator>(pub usize, pub Box<I>);
 
 impl<I: StorageIterator> PartialEq for HeapWrapper<I> {
@@ -40,6 +42,10 @@ impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
 
 impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
+        // BinaryHeap is a max-heap. Reverse (key, input index) so the smallest
+        // key wins, and ties prefer the earlier input (the caller's priority).
+        // Compare KEY first: an older source at a must precede a newer one at b.
+        // Recency only resolves ties, e.g. input 0's b wins over input 1's b.
         self.1
             .key()
             .cmp(&other.1.key())
@@ -57,6 +63,8 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
+        // Input cursors must already be positioned. An empty input vector and a
+        // vector of exhausted cursors both produce an invalid merged cursor.
         if iters.is_empty() {
             return Self {
                 iters: BinaryHeap::new(),
@@ -81,6 +89,7 @@ impl<I: StorageIterator> MergeIterator<I> {
             }
         }
 
+        // Keep the winning cursor outside the heap; the heap holds its competitors.
         let current = heap.pop().unwrap();
         Self {
             iters: heap,
@@ -111,7 +120,12 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 
     fn next(&mut self) -> Result<()> {
         let current = self.current.as_mut().unwrap();
-        // Pop the item out of the heap if they have the same value.
+        // Before advancing the winner, consume all competing copies of its KEY.
+        // Values are irrelevant here: a winning tombstone must hide older values.
+        // Dropping PeekMut reorders the heap after a child advances.
+        // Example: current=input0 at b, heap=input1 at b and input2 at c.
+        // Advance input1 past b BEFORE current moves; otherwise we could emit b
+        // a second time. Repeat because several heap children may also be at b.
         while let Some(mut inner_iter) = self.iters.peek_mut() {
             debug_assert!(
                 inner_iter.1.key() >= current.1.key(),
@@ -143,7 +157,9 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             return Ok(());
         }
 
-        // Otherwise, compare with heap top and swap if necessary.
+        // Otherwise, compare with heap top and swap if necessary. Because cmp()
+        // is reversed, current < heap_top means the heap cursor should win next
+        // (it has a smaller key, or the same key with higher source priority).
         if let Some(mut inner_iter) = self.iters.peek_mut()
             && *current < *inner_iter
         {

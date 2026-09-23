@@ -31,6 +31,9 @@ pub struct Block {
 
 impl Block {
     pub fn encode(&self) -> Bytes {
+        // Layout: encoded entries | u16 entry offsets | u16 entry count.
+        // Reading the count from the end locates the offset array without parsing
+        // every entry. Those offsets enable binary search in BlockIterator.
         let mut buf = self.data.clone();
         let offsets_len = self.offsets.len();
         for offset in &self.offsets {
@@ -46,6 +49,9 @@ impl Block {
     }
 
     pub(crate) fn decode_checked(data: &[u8]) -> Result<Self> {
+        // Work backward from the footer, then validate every entry boundary.
+        // Bytes from disk must be checked before iterators can index them safely;
+        // a valid checksum alone does not establish a valid internal structure.
         // get number of elements in the block
         ensure!(data.len() >= SIZEOF_U16, "block footer is truncated");
         let entry_offsets_len =

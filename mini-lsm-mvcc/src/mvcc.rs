@@ -39,6 +39,8 @@ pub(crate) struct CommittedTxnData {
 }
 
 pub(crate) struct LsmMvccInner {
+    // write_lock serializes timestamp allocation + publication. commit_lock also
+    // covers conflict validation and history registration for transactions.
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) ts: Arc<Mutex<(u64, Watermark)>>,
@@ -63,13 +65,18 @@ impl LsmMvccInner {
         self.ts.lock().0 = ts;
     }
 
-    /// All ts (strictly) below this ts can be garbage collected.
+    /// Oldest active read timestamp, or latest commit timestamp with no readers.
+    /// Compaction must still retain the newest version <= this watermark for each
+    /// key; older versions may be removed when they are no longer needed.
     pub fn watermark(&self) -> u64 {
         let ts = self.ts.lock();
         ts.1.watermark().unwrap_or(ts.0)
     }
 
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
+        // Capture read_ts and register its reader under the SAME mutex. Otherwise
+        // GC could advance between those operations and discard data we need.
+        // The transaction's eventual Drop unregisters it; clones share one lifetime.
         let mut ts = self.ts.lock();
         let read_ts = ts.0;
         ts.1.add_reader(read_ts);

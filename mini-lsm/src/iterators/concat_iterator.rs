@@ -33,6 +33,8 @@ pub struct SstConcatIterator {
 
 impl SstConcatIterator {
     fn check_sst_valid(sstables: &[Arc<SsTable>]) {
+        // Within one level/tier, SST key ranges are sorted and disjoint. This
+        // allows visiting one table at a time; overlapping L0 tables need a merge.
         for sst in sstables {
             assert!(sst.first_key() <= sst.last_key());
         }
@@ -65,6 +67,8 @@ impl SstConcatIterator {
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
         Self::check_sst_valid(&sstables);
+        // Start at the last table whose first key <= target (or table 0). If the
+        // target falls in a gap, move_until_valid continues into the next table.
         let idx: usize = sstables
             .partition_point(|table| table.first_key().as_key_slice() <= key)
             .saturating_sub(1);
@@ -88,6 +92,7 @@ impl SstConcatIterator {
     }
 
     fn move_until_valid(&mut self) -> Result<()> {
+        // Hold only one SST cursor at a time and open the next one on demand.
         while let Some(iter) = self.current.as_mut() {
             if iter.is_valid() {
                 break;

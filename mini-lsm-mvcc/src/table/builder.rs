@@ -53,6 +53,9 @@ impl SsTableBuilder {
 
     /// Adds a key-value pair to SSTable
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        // Block boundaries retain complete timestamped keys, but Bloom hashes
+        // use only user-key bytes so a lookup can ask about any visible version.
+        // max_ts is a recovery high-water mark; it is not a visibility filter.
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }

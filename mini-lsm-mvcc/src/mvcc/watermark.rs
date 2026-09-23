@@ -32,10 +32,14 @@ impl Watermark {
     }
 
     pub fn add_reader(&mut self, ts: u64) {
+        // Count readers per timestamp: two transactions can share the same read_ts.
+        // A set alone would remove protection when only one of those readers drops.
         *self.readers.entry(ts).or_default() += 1;
     }
 
     pub fn remove_reader(&mut self, ts: u64) {
+        // Remove the timestamp only when its final reader disappears. For readers
+        // [5,5,8], dropping one 5 leaves watermark=5; dropping both moves it to 8.
         let cnt = self.readers.get_mut(&ts).unwrap();
         *cnt -= 1;
         if *cnt == 0 {
@@ -48,6 +52,7 @@ impl Watermark {
     }
 
     pub fn watermark(&self) -> Option<u64> {
+        // BTreeMap keeps timestamps ordered, so the first key is the oldest reader.
         self.readers.first_key_value().map(|(ts, _)| *ts)
     }
 }

@@ -30,6 +30,8 @@ pub struct Manifest {
 
 #[derive(Serialize, Deserialize)]
 pub enum ManifestRecord {
+    // This is a log of STRUCTURAL changes, not user key/value writes. Replay it
+    // to discover live SSTs and WALs; the WAL carries the unflushed user records.
     Flush(usize),
     NewMemtable(usize),
     Compaction(CompactionTask, Vec<usize>),
@@ -50,6 +52,9 @@ impl Manifest {
     }
 
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
+        // Frame = body_len:u64 | JSON body | CRC:u32. Replay complete frames in
+        // order. An incomplete final frame is a torn append and is truncated;
+        // a complete frame with a bad CRC is corruption and returns an error.
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -132,6 +137,9 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        // Serialize appenders so length/body/checksum from different records do
+        // not interleave, and sync before returning. File creation and deletion
+        // also need directory syncing, which the storage layer handles separately.
         let mut file = self.file.lock();
         let mut buf = serde_json::to_vec(&record)?;
         let hash = crc32fast::hash(&buf);

@@ -56,10 +56,16 @@ impl SsTableIterator {
     }
 
     fn seek_to_key_inner(table: &Arc<SsTable>, key: KeySlice) -> Result<(usize, BlockIterator)> {
+        // Two-stage seek: search the in-memory block index, then search entries
+        // inside the selected block. Loading that block may perform disk I/O.
+        // Example blocks [a..f], [m..r]: seeking h selects the first block by its
+        // first key, exhausts it, then lands on m in the second block below.
         let mut blk_idx = table.find_block_idx(key);
         let mut blk_iter =
             BlockIterator::create_and_seek_to_key(table.read_block_cached(blk_idx)?, key);
         if !blk_iter.is_valid() {
+            // The key may fall in a gap after this block. The next block's first
+            // entry is then the first key >= the target (if another block exists).
             blk_idx += 1;
             if blk_idx < table.num_of_blocks() {
                 blk_iter =
@@ -107,6 +113,8 @@ impl StorageIterator for SsTableIterator {
     fn next(&mut self) -> Result<()> {
         self.blk_iter.next();
         if !self.blk_iter.is_valid() {
+            // A block ending is not necessarily the table ending. Switch blocks
+            // lazily; this is why the table cursor's next() can return an I/O error.
             self.blk_idx += 1;
             if self.blk_idx < self.table.num_of_blocks() {
                 self.blk_iter = BlockIterator::create_and_seek_to_first(
