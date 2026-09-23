@@ -44,8 +44,8 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         // BinaryHeap is a max-heap. Reverse (key, input index) so the smallest
         // key wins, and ties prefer the earlier input (the caller's priority).
-        // Compare KEY first: an older source at a must precede a newer one at b.
-        // Recency only resolves ties, e.g. input 0's b wins over input 1's b.
+        // Compare KEY first: input 1 at a must precede input 0 at b. Input priority
+        // only resolves ties. Read-path callers use this to encode source recency.
         self.1
             .key()
             .cmp(&other.1.key())
@@ -54,8 +54,10 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
     }
 }
 
-/// Merge multiple iterators of the same type. If the same key occurs multiple times in some
-/// iterators, prefer the one with smaller index.
+/// Merge positioned, sorted children of the same type. Each child must itself
+/// emit unique keys. Across children, equal keys choose the smaller input index.
+/// The key comparator defines equality/order; values do not affect either rule.
+/// No engine lock is acquired by this merge; child operations may perform I/O.
 pub struct MergeIterator<I: StorageIterator> {
     iters: BinaryHeap<HeapWrapper<I>>,
     current: Option<HeapWrapper<I>>,
@@ -121,7 +123,8 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     fn next(&mut self) -> Result<()> {
         let current = self.current.as_mut().unwrap();
         // Before advancing the winner, consume all competing copies of its KEY.
-        // Values are irrelevant here: a winning tombstone must hide older values.
+        // Values are irrelevant here: ordinary overwrites and tombstones obey
+        // exactly the same rule. Visibility/compaction policy belongs downstream.
         // Dropping PeekMut reorders the heap after a child advances.
         // Example: current=input0 at b, heap=input1 at b and input2 at c.
         // Advance input1 past b BEFORE current moves; otherwise we could emit b

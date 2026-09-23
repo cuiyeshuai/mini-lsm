@@ -196,7 +196,12 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    // state protects the current layout pointer. Readers briefly clone its Arc;
+    // writers replace the pointer under state.write(). The shared memtable itself
+    // uses a concurrent skipmap: holding a layout Arc does not freeze its contents.
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    // Serializes structural operations across their multiple phases (including
+    // I/O), beyond a single state.write() section. Ordinary reads do not take it.
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
@@ -232,6 +237,8 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
+        // Caller must stop concurrent foreground operations before closing. Joining
+        // workers alone does not prevent another public handle from issuing writes.
         // Stop and join background workers before the final persistence step.
         // With WAL, sync is sufficient; without WAL, freeze the current memtable
         // and drain immutable tables into SSTs. Drop only signals workers, so
@@ -240,6 +247,9 @@ impl MiniLsm {
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
 
+        // These mutexes protect taking/joining each worker handle, not LSM data.
+        // Named guards remain held through the rest of close(), releasing on any
+        // return. Workers do not need these handle mutexes to finish their work.
         let mut compaction_thread = self.compaction_thread.lock();
         if let Some(compaction_thread) = compaction_thread.take() {
             compaction_thread
@@ -336,6 +346,9 @@ impl MiniLsm {
 
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
+        // Test helper: use without concurrent writes. Each condition's temporary
+        // state read guard releases before its body; the temporary structural guard
+        // passed to force_freeze_memtable lasts for that call only.
         if !self.inner.state.read().memtable.is_empty() {
             self.inner
                 .force_freeze_memtable(&self.inner.state_lock.lock())?;
@@ -504,11 +517,17 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
+        // Acquire structural -> state read -> WAL file mutex. The temporary read
+        // guard lives through sync_wal(); both outer guards release on return.
+        // This prevents rotation, not concurrent puts into the same map. With WAL
+        // disabled, sync_wal() is a no-op; sync() does not flush memory into SSTs.
         let _state_lock = self.state_lock.lock();
         self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
+        // Acquire only the filter-list mutex; release at this function's end.
+        // Registration does not rewrite data or hold this lock until compaction.
         let mut compaction_filters = self.compaction_filters.lock();
         compaction_filters.push(compaction_filter);
     }
@@ -521,7 +540,7 @@ impl LsmStorageInner {
             let guard = self.state.read();
             // Increment an Arc reference count; do not copy maps, tables, or data.
             Arc::clone(&guard)
-        }; // drop global lock here
+        }; // state read guard releases here; snapshot retains an Arc, not a lock.
 
         // 2. Search memory in precedence order: current, then newest immutable
         // through oldest. The first occurrence is authoritative, even a deletion.
@@ -612,7 +631,7 @@ impl LsmStorageInner {
         validate_write_batch(batch)?;
         // Week 2 batches share an API, but apply records one at a time. They can
         // freeze between entries and are not atomic transactions. Week 3 adds a
-        // shared commit timestamp and a single WAL frame for atomic publication.
+        // shared timestamp for atomic visibility and one WAL frame for atomic replay.
         for record in batch {
             match record {
                 WriteBatchRecord::Del(key) => {
@@ -620,10 +639,12 @@ impl LsmStorageInner {
                     assert!(!key.is_empty(), "key cannot be empty");
                     let size;
                     {
+                        // Acquire state.read() through map update + WAL append;
+                        // rotation needs state.write() and must wait for this write.
                         let guard = self.state.read();
                         guard.memtable.put(key, b"")?;
                         size = guard.memtable.approximate_size();
-                    }
+                    } // Release read guard BEFORE try_freeze takes structural lock.
                     self.try_freeze(size)?;
                 }
                 WriteBatchRecord::Put(key, value) => {
@@ -633,10 +654,12 @@ impl LsmStorageInner {
                     assert!(!value.is_empty(), "value cannot be empty");
                     let size;
                     {
+                        // Acquire state.read() through map update + WAL append;
+                        // rotation needs state.write() and must wait for this write.
                         let guard = self.state.read();
                         guard.memtable.put(key, value)?;
                         size = guard.memtable.approximate_size();
-                    }
+                    } // Release read guard BEFORE try_freeze takes structural lock.
                     self.try_freeze(size)?;
                 }
             }
@@ -659,10 +682,13 @@ impl LsmStorageInner {
         // Check again after locking: another writer may already have frozen the
         // full memtable. Drop the read guard before acquiring the write guard.
         if estimated_size >= self.options.target_sst_size {
+            // Hold the structural mutex to this if-block's end (also on `?`).
             let state_lock = self.state_lock.lock();
             let guard = self.state.read();
             // the memtable could have already been frozen, check again to ensure we really need to freeze
             if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                // Release the read guard BEFORE the helper takes state.write().
+                // Keeping it would block our own write-lock acquisition.
                 drop(guard);
                 self.force_freeze_memtable(&state_lock)?;
             }
@@ -704,6 +730,9 @@ impl LsmStorageInner {
         // Update the snapshot.
         *guard = Arc::new(snapshot);
 
+        // Release state.write() before WAL I/O; the caller's structural guard
+        // (on the normal freeze path) remains held. The swap already happened:
+        // a sync error below releases locks but does not undo that layout change.
         drop(guard);
         old_memtable.sync_wal()?;
 
@@ -712,6 +741,8 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        // BORROW the caller's structural guard; this function neither acquires
+        // nor releases that mutex. The caller must pass this engine's state_lock.
         // Create the replacement (and its WAL), record NewMemtable, then publish
         // the swap. The MutexGuard argument documents the structural lock held
         // across this sequence, beyond the short state RwLock critical section.
@@ -744,6 +775,8 @@ impl LsmStorageInner {
         // newer memory remains above it. Build and sync the file before replacing
         // its memory source; record Flush before removing the corresponding WAL.
         // A concurrent reader retains its old memtable or sees the replacement SST.
+        // Acquire once and retain until return, across SST construction, layout
+        // installation, manifest sync, and WAL removal. `?` also drops this guard.
         let state_lock = self.state_lock.lock();
 
         let flush_memtable = {
@@ -752,7 +785,8 @@ impl LsmStorageInner {
                 return Ok(());
             };
             flush_memtable.clone()
-        };
+        }; // Release state.read(); retain the selected map via its Arc.
+        // SST I/O below holds state_lock, but neither state.read() nor state.write().
 
         let mut builder = SsTableBuilder::new(self.options.block_size);
         flush_memtable.flush(&mut builder)?;
@@ -783,7 +817,7 @@ impl LsmStorageInner {
             snapshot.sstables.insert(sst_id, sst);
             // Update the snapshot.
             *guard = Arc::new(snapshot);
-        }
+        } // Release state.write(); state_lock still spans the manifest operation.
 
         self.manifest
             .as_ref()
@@ -818,7 +852,7 @@ impl LsmStorageInner {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
-        }; // drop global lock here
+        }; // state read guard releases here; snapshot retains an Arc, not a lock.
 
         // 2. Build bounded memory cursors. Input order is part of correctness:
         // current memtable wins ties, then immutable memtables newest to oldest.

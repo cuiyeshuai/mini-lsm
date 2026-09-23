@@ -84,7 +84,8 @@ impl LeveledCompactionController {
     ) -> Option<LeveledCompactionTask> {
         // step 1: compute target level size
         // Dynamic targets grow backward from the bottom using byte sizes, unlike
-        // simple compaction's file counts. Zero-target shallow levels stay empty;
+        // simple compaction's file counts. Zero-target levels receive no new L0
+        // output; existing data can still require compaction as targets change;
         // base_level is where L0 output should enter the leveled part of the tree.
         let mut target_level_size = (0..self.options.max_levels).map(|_| 0).collect::<Vec<_>>(); // exclude level 0
         let mut real_level_size = Vec::with_capacity(self.options.max_levels);

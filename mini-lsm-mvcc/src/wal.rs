@@ -131,6 +131,8 @@ impl Wal {
         // Frame = body_bytes:u32 | (key_len,key,ts,value_len,value)* | CRC:u32.
         // One transaction uses one frame even if it exceeds the memtable target.
         // A torn final frame is discarded on recovery; earlier frames remain valid.
+        // Acquire the WAL file mutex until return, including `?` error exits.
+        // It serializes this file's append/sync operations, not skipmap mutations.
         let mut file = self.file.lock();
         let mut buf = Vec::<u8>::new();
         for (key, value) in data {
@@ -157,6 +159,8 @@ impl Wal {
     }
 
     pub fn sync(&self) -> Result<()> {
+        // Acquire the WAL file mutex until return, including `?` error exits.
+        // It serializes this file's append/sync operations, not skipmap mutations.
         let mut file = self.file.lock();
         file.flush()?;
         file.get_mut().sync_all()?;

@@ -117,6 +117,11 @@ impl MemTable {
         // replaces the first. An empty value keeps a deletion marker in the map.
         // approximate_size counts bytes submitted, including overwrites; it is a
         // freeze trigger estimate, not an exact measurement of current live data.
+        // There is no memtable-wide mutex here. The engine's state read guard
+        // prevents rotation, while SkipMap permits concurrent entry updates.
+        // Memory changes BEFORE WAL append: an append error does not undo the put.
+        // Concurrent writers can order map updates and WAL appends differently;
+        // the WAL mutex alone does not make those two steps one atomic operation.
         let estimated_size = key.len() + value.len();
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));

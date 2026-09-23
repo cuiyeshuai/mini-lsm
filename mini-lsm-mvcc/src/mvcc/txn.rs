@@ -35,6 +35,9 @@ use crate::{
     mvcc::CommittedTxnData,
 };
 
+/// Use one foreground thread per transaction, including its iterators. The atomic
+/// committed flag prevents a second commit; it does not make concurrent workspace
+/// edits and commit one atomic operation. Separate transactions can run concurrently.
 pub struct Transaction {
     pub(crate) read_ts: u64,
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -56,7 +59,7 @@ impl Transaction {
             let mut guard = guard.lock();
             let (_, read_set) = &mut *guard;
             read_set.insert(farmhash::hash32(key));
-        }
+        } // Release key_hashes before any shared-engine read or further iteration.
         if let Some(entry) = self.local_storage.get(key) {
             if entry.value().is_empty() {
                 return Ok(None);
@@ -103,7 +106,7 @@ impl Transaction {
             let mut key_hashes = key_hashes.lock();
             let (write_hashes, _) = &mut *key_hashes;
             write_hashes.insert(farmhash::hash32(key));
-        }
+        } // Release key_hashes; no mutex is retained between transaction operations.
     }
 
     pub fn delete(&self, key: &[u8]) {
@@ -118,7 +121,7 @@ impl Transaction {
             let mut key_hashes = key_hashes.lock();
             let (write_hashes, _) = &mut *key_hashes;
             write_hashes.insert(farmhash::hash32(key));
-        }
+        } // Release key_hashes; no mutex is retained between transaction operations.
     }
 
     pub fn commit(&self) -> Result<()> {
@@ -129,9 +132,12 @@ impl Transaction {
         self.committed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .expect("cannot operate on committed txn!");
+        // Acquire until function return, including empty commits and `?`/bail exits.
+        // This named guard also remains held while write_batch_inner takes write_lock.
         let _commit_lock = self.inner.mvcc().commit_lock.lock();
         let serializability_check;
         if let Some(guard) = &self.key_hashes {
+            // During validation: key_hashes -> committed_txns (if there are writes).
             let guard = guard.lock();
             let (write_set, read_set) = &*guard;
             println!(
@@ -151,6 +157,8 @@ impl Transaction {
                     }
                 }
             }
+            // committed_txns released at the inner if-block's end; key_hashes
+            // releases at the end of this outer branch, before batch publication.
             serializability_check = true;
         } else {
             serializability_check = false;
@@ -170,8 +178,14 @@ impl Transaction {
             // Read-only commit needs no new timestamp, WAL record, or history entry.
             return Ok(());
         }
+        // write_batch_inner releases write_lock before returning. A post-publication
+        // freeze error can return here before history registration; errors do not
+        // generally mean "nothing committed" or promise safe continued validation.
         let ts = self.inner.write_batch_inner(&batch)?;
         if serializability_check {
+            // Registration takes committed_txns -> key_hashes, the reverse of
+            // validation. commit_lock excludes other commits during both phases;
+            // this is NOT a universal lock order usable by arbitrary new callers.
             let mut committed_txns = self.inner.mvcc().committed_txns.lock();
             let mut key_hashes = self.key_hashes.as_ref().unwrap().lock();
             let (write_set, _) = &mut *key_hashes;
@@ -186,7 +200,8 @@ impl Transaction {
             );
             assert!(old_data.is_none());
 
-            // remove unneeded txn data
+            // watermark() briefly acquires ts while both guards above are held.
+            // Remove old conflict metadata; both guards release at this if's end.
             let watermark = self.inner.mvcc().watermark();
             while let Some(entry) = committed_txns.first_entry() {
                 if *entry.key() < watermark {
@@ -204,6 +219,8 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // A TxnIterator holds an Arc<Transaction>, so dropping the user's handle
         // alone cannot release the snapshot while that scan still needs it.
+        // Acquire ts to decrement the reader count; release on returning from Drop.
+        // commit() does not unregister: the final Arc drop does.
         self.inner.mvcc().ts.lock().1.remove_reader(self.read_ts)
     }
 }
@@ -285,7 +302,7 @@ impl TxnIterator {
             let mut guard = guard.lock();
             let (_, read_set) = &mut *guard;
             read_set.insert(farmhash::hash32(key));
-        }
+        } // Release key_hashes before any shared-engine read or further iteration.
     }
 }
 

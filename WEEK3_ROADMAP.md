@@ -15,7 +15,12 @@ Keep four mechanisms separate:
 | Commit validation | Did a newer committed write invalidate this transaction's tracked reads? |
 
 A timestamp controls **visibility**. One WAL frame controls **recovery atomicity**.
-Successful `sync` controls **durability**. These are different guarantees.
+With WAL enabled, a successfully completed write followed by successful WAL `sync`
+provides the file **durability** boundary. Without WAL, persistence requires SST and
+manifest work; engine `sync` does not flush memory. These are different guarantees.
+
+For lock acquisition/release, ownership, preconditions, and error boundaries, keep
+[Locks, ownership, and guarantees](LOCKING_AND_INVARIANTS.md) open alongside this guide.
 
 ## Day 1 — Timestamp Key Encoding + Refactor
 
@@ -52,7 +57,7 @@ an arbitrary snapshot timestamp?
 
 ### Task 3: LSM Iterators
 
-Read [HeapWrapper::cmp](mini-lsm-mvcc/src/iterators/merge_iterator.rs#L42) →
+Read [HeapWrapper::cmp](mini-lsm-mvcc/src/iterators/merge_iterator.rs#L44) →
 [LsmIterator::key](mini-lsm-mvcc/src/lsm_iterator.rs#L130). Merge equality now means equal **internal** keys, so a@9
 and a@4 are different entries and both survive the raw merge. The public key method
 strips the timestamp. Day 3's visibility logic decides which version to expose;
@@ -61,15 +66,15 @@ merging alone does not make that decision.
 
 ### Task 4: Memtable
 
-Read [MemTable](mini-lsm-mvcc/src/mem_table.rs#L35) → [MemTable::put_batch](mini-lsm-mvcc/src/mem_table.rs#L165) → [MemTable::scan](mini-lsm-mvcc/src/mem_table.rs#L194) →
-[MemTable::flush](mini-lsm-mvcc/src/mem_table.rs#L210). In the completed solution the map is already keyed by
+Read [MemTable](mini-lsm-mvcc/src/mem_table.rs#L35) → [MemTable::put_batch](mini-lsm-mvcc/src/mem_table.rs#L165) → [MemTable::scan](mini-lsm-mvcc/src/mem_table.rs#L196) →
+[MemTable::flush](mini-lsm-mvcc/src/mem_table.rs#L212). In the completed solution the map is already keyed by
 `KeyBytes`, so different timestamps coexist and flushing preserves them. The book's
 Day 1 intermediate stage still uses default timestamps; later days supply real ones.
 **Check:** Which field makes replacing a@9 different from inserting a@10?
 
 ### Task 5: Engine Read Path
 
-Read [LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L528) → [LsmStorageInner::scan_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L839) and
+Read [LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L547) → [LsmStorageInner::scan_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L878) and
 [range_overlap](mini-lsm-mvcc/src/lsm_storage.rs#L165). Seeks use timestamped keys, while table-range pruning compares
 user-key bytes. `a@MAX` is the beginning of a's full version range, not a real commit.
 In the finished code these functions also apply read timestamps, covered below.
@@ -87,7 +92,7 @@ make reads consistently select from versioned sources.
 ### Task 1: MemTable, Write-Ahead Log, and Read Path
 
 Read [MemTable::put_batch](mini-lsm-mvcc/src/mem_table.rs#L165) → [Wal::put_batch](mini-lsm-mvcc/src/wal.rs#L130) →
-[LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L528) → [map_key_bound_plus_ts](mini-lsm-mvcc/src/mem_table.rs#L67). Memory and WAL
+[LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L547) → [map_key_bound_plus_ts](mini-lsm-mvcc/src/mem_table.rs#L67). Memory and WAL
 store the timestamp with each entry. A point read scans the target user's version
 range rather than performing an exact timestamp-free map lookup. Scan bounds must
 account for descending timestamp order.
@@ -97,10 +102,14 @@ For versions `a@9=new,a@4=old`, a read at 6 must continue past a@9 to find a@4.
 
 ### Task 2: Write Path
 
-Read [LsmMvccInner::latest_commit_ts](mini-lsm-mvcc/src/mvcc.rs#L60) → [LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L610)
-→ [LsmMvccInner::update_commit_ts](mini-lsm-mvcc/src/mvcc.rs#L64). Under `write_lock`, allocate one timestamp
+Read [LsmMvccInner::latest_commit_ts](mini-lsm-mvcc/src/mvcc.rs#L62) → [LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L629)
+→ [LsmMvccInner::update_commit_ts](mini-lsm-mvcc/src/mvcc.rs#L67). Under `write_lock`, allocate one timestamp
 for the whole batch, insert all its entries, then publish the timestamp. New
 snapshots capture the published clock; older snapshots ignore entries above it.
+`write_lock` stays acquired through the subsequent freeze attempt and releases on
+function return. The state read guard ends before publication; each clock access
+uses a separate short `ts` guard. See the [full write sequence](LOCKING_AND_INVARIANTS.md#4-writes-and-freeze-why-dropping-the-read-guard-matters).
+A freeze error can return after publication, so `Err` does not always mean rollback.
 
 At latest=5, a batch writes a@6 and b@6. Until publication, new readers still
 capture 5 and see neither update. **Check:** Why must publication happen after
@@ -108,7 +117,7 @@ both insertions, and before fallible freeze maintenance?
 
 ### Task 3: MVCC Compaction
 
-Read [LsmStorageInner::compact](mini-lsm-mvcc/src/compact.rs#L246) → [LsmStorageInner::compact_generate_sst_from_iter](mini-lsm-mvcc/src/compact.rs#L130).
+Read [LsmStorageInner::compact](mini-lsm-mvcc/src/compact.rs#L251) → [LsmStorageInner::compact_generate_sst_from_iter](mini-lsm-mvcc/src/compact.rs#L130).
 The merge now preserves different timestamps of a user key. At this stage of the
 course, the key requirement is not to collapse history as if it were Week 2 data.
 The finished generator additionally applies Day 4 watermark GC and Day 7 filters;
@@ -134,7 +143,7 @@ operations, select the right version, and preserve the timestamp clock on restar
 
 ### Task 1: LSM Iterator with Read Timestamp
 
-Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L76) → [LsmIterator::new](mini-lsm-mvcc/src/lsm_iterator.rs#L42) → [LsmIterator::move_to_key](mini-lsm-mvcc/src/lsm_iterator.rs#L80).
+Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L81) → [LsmIterator::new](mini-lsm-mvcc/src/lsm_iterator.rs#L42) → [LsmIterator::move_to_key](mini-lsm-mvcc/src/lsm_iterator.rs#L80).
 A transaction captures one `read_ts`. For each user key, skip versions above that
 timestamp and inspect the first version at or below it. If live, return it; if a
 tombstone, suppress the entire user key, including older live versions.
@@ -144,8 +153,8 @@ at 2 return old. **Check:** Why is a too-new tombstone irrelevant to an older sn
 
 ### Task 2: Multi-Version Scan and Get
 
-Read [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L48) → [LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L528), then
-[Transaction::scan](mini-lsm-mvcc/src/mvcc/txn.rs#L70) → [LsmStorageInner::scan_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L839) →
+Read [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L51) → [LsmStorageInner::get_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L547), then
+[Transaction::scan](mini-lsm-mvcc/src/mvcc/txn.rs#L73) → [LsmStorageInner::scan_with_ts](mini-lsm-mvcc/src/lsm_storage.rs#L878) →
 [map_key_bound_plus_ts](mini-lsm-mvcc/src/mem_table.rs#L67). The local workspace is a Day 5 addition; with it empty,
 follow the shared snapshot path. An excluded lower user key must skip every version
 of that key in SSTs, so the code uses `while`, not Week 1's single `if` advance.
@@ -164,7 +173,7 @@ be the final key in lexical order; the first inserted key can hold that maximum.
 
 ### Task 4: Recover Commit Timestamp
 
-Read [LsmStorageInner::open](mini-lsm-mvcc/src/lsm_storage.rs#L361), particularly `last_commit_ts`, SST opening, WAL
+Read [LsmStorageInner::open](mini-lsm-mvcc/src/lsm_storage.rs#L374), particularly `last_commit_ts`, SST opening, WAL
 replay, and construction of `LsmMvccInner`. Start from the maximum timestamp seen
 in all surviving SSTs and recovered memory. The next batch uses a larger value.
 File ids and manifest positions are unrelated to the commit clock.
@@ -184,7 +193,7 @@ ordinary reads held by live snapshots.
 ### Task 1: Implement Watermark
 
 Read [Watermark::add_reader](mini-lsm-mvcc/src/mvcc/watermark.rs#L34) → [Watermark::remove_reader](mini-lsm-mvcc/src/mvcc/watermark.rs#L40) →
-[Watermark::watermark](mini-lsm-mvcc/src/mvcc/watermark.rs#L54) → [LsmMvccInner::watermark](mini-lsm-mvcc/src/mvcc.rs#L71). Store a reader count per
+[Watermark::watermark](mini-lsm-mvcc/src/mvcc/watermark.rs#L54) → [LsmMvccInner::watermark](mini-lsm-mvcc/src/mvcc.rs#L75). Store a reader count per
 timestamp, and return the smallest active timestamp. With no active readers, the
 MVCC layer uses the latest committed timestamp.
 
@@ -193,9 +202,11 @@ dropping the other moves it to 8. **Check:** Why would a set of timestamps be in
 
 ### Task 2: Maintain Watermark in Transactions
 
-Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L76) → [Transaction::drop](mini-lsm-mvcc/src/mvcc/txn.rs#L204) → [TxnIterator](mini-lsm-mvcc/src/mvcc/txn.rs#L256).
+Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L81) → [Transaction::drop](mini-lsm-mvcc/src/mvcc/txn.rs#L219) → [TxnIterator](mini-lsm-mvcc/src/mvcc/txn.rs#L273).
 Capture the timestamp and register the reader while holding the same mutex. The
-transaction's final `Drop` unregisters it. A scan owns an `Arc<Transaction>`, so
+transaction's final `Drop` unregisters it under a newly acquired short `ts` guard.
+The `new_txn` guard releases when construction returns; the registry entry, not a
+held mutex, protects the snapshot. Commit does not unregister it. A scan owns an `Arc<Transaction>`, so
 its snapshot remains protected even after the caller drops their transaction handle.
 **Check:** What race becomes possible if capturing and registering happen under separate locks?
 
@@ -203,7 +214,9 @@ its snapshot remains protected even after the caller drops their transaction han
 
 Read [LsmStorageInner::compact_generate_sst_from_iter](mini-lsm-mvcc/src/compact.rs#L130). Keep all versions newer
 than the watermark and the newest version at or below it as the baseline. Versions
-older than that baseline can be removed. The bottom-level tombstone case can remove
+older than that baseline can be removed. The watermark mutex releases inside
+`watermark()`; the copied value is retained throughout the rewrite. The filter-list
+mutex likewise releases immediately after cloning the policies. The bottom-level tombstone case can remove
 an entire obsolete deleted history; above bottom, deletion markers may still be needed.
 
 At watermark=6, `[a@9,a@7,a@4,a@1]` retains 9,7,4. The a@4 version is still needed
@@ -224,7 +237,7 @@ then publish and recover one complete transaction.
 
 ### Task 1: Local Workspace + Put and Delete
 
-Read [Transaction](mini-lsm-mvcc/src/mvcc/txn.rs#L38) → [Transaction::put](mini-lsm-mvcc/src/mvcc/txn.rs#L94) → [Transaction::delete](mini-lsm-mvcc/src/mvcc/txn.rs#L109).
+Read [Transaction](mini-lsm-mvcc/src/mvcc/txn.rs#L41) → [Transaction::put](mini-lsm-mvcc/src/mvcc/txn.rs#L97) → [Transaction::delete](mini-lsm-mvcc/src/mvcc/txn.rs#L112).
 The workspace is a private user-key map without timestamps. Repeated puts replace
 its local entry; delete stores a tombstone rather than removing it. Nothing enters
 the shared memtable or WAL yet. Timestamps are assigned when the batch commits.
@@ -232,8 +245,8 @@ the shared memtable or WAL yet. Timestamps are assigned when the batch commits.
 
 ### Task 2: Get and Scan
 
-Read [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L48) → [Transaction::scan](mini-lsm-mvcc/src/mvcc/txn.rs#L70) → [TxnIterator::create](mini-lsm-mvcc/src/mvcc/txn.rs#L262)
-→ [TxnIterator::skip_deletes](mini-lsm-mvcc/src/mvcc/txn.rs#L274) → [TxnIterator::next](mini-lsm-mvcc/src/mvcc/txn.rs#L310). Local entries override
+Read [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L51) → [Transaction::scan](mini-lsm-mvcc/src/mvcc/txn.rs#L73) → [TxnIterator::create](mini-lsm-mvcc/src/mvcc/txn.rs#L279)
+→ [TxnIterator::skip_deletes](mini-lsm-mvcc/src/mvcc/txn.rs#L291) → [TxnIterator::next](mini-lsm-mvcc/src/mvcc/txn.rs#L327). Local entries override
 shared snapshot entries on equal user keys. The two-way merge resolves that conflict;
 only afterward does the transaction iterator hide local deletion markers.
 
@@ -243,11 +256,14 @@ For shared `[a:1,b:2]` and local `[a:9,b:delete,c:3]`, the transaction scans
 
 ### Task 3: Commit
 
-Read [Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L124) → [LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L610) →
+Read [Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L127) → [LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L629) →
 [MemTable::put_batch](mini-lsm-mvcc/src/mem_table.rs#L165). The transaction becomes one-shot, collects its workspace
 into a batch, writes one timestamp into one memtable, then publishes that timestamp.
 An empty batch returns without allocating a new timestamp. Day 6 adds validation
 around this path; it is already present in the completed function.
+Use one foreground thread per transaction and its iterators: the atomic committed
+flag is not a lock around concurrent workspace edits. Separate transactions can
+run concurrently. See [transaction lock lifetimes and failure cases](LOCKING_AND_INVARIANTS.md#7-transaction-lifetime-and-commit).
 **Check:** Why should a batch exceeding the target size finish before freezing?
 
 ### Task 4: Atomic WAL
@@ -276,8 +292,8 @@ SSI implementation; scan gaps are not tracked, so phantoms remain possible.
 
 ### Task 1: Track Read Set in Get and Write Set
 
-Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L76) → [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L48) →
-[Transaction::put](mini-lsm-mvcc/src/mvcc/txn.rs#L94) → [Transaction::delete](mini-lsm-mvcc/src/mvcc/txn.rs#L109). Enable hash sets when
+Read [LsmMvccInner::new_txn](mini-lsm-mvcc/src/mvcc.rs#L81) → [Transaction::get](mini-lsm-mvcc/src/mvcc/txn.rs#L51) →
+[Transaction::put](mini-lsm-mvcc/src/mvcc/txn.rs#L97) → [Transaction::delete](mini-lsm-mvcc/src/mvcc/txn.rs#L112). Enable hash sets when
 `serializable` is true. Every point-read key enters the read set even when absent;
 puts and deletes enter the write set. Hash collisions can cause false conflicts.
 **Check:** If a transaction reads missing a and another inserts a, why is the first
@@ -285,19 +301,23 @@ transaction's later dependent write subject to validation?
 
 ### Task 2: Track Read Set in Scan
 
-Read [TxnIterator::create](mini-lsm-mvcc/src/mvcc/txn.rs#L262) → [TxnIterator::add_to_read_set](mini-lsm-mvcc/src/mvcc/txn.rs#L281) →
-[TxnIterator::next](mini-lsm-mvcc/src/mvcc/txn.rs#L310). Track the initial returned key and later returned keys.
+Read [TxnIterator::create](mini-lsm-mvcc/src/mvcc/txn.rs#L279) → [TxnIterator::add_to_read_set](mini-lsm-mvcc/src/mvcc/txn.rs#L298) →
+[TxnIterator::next](mini-lsm-mvcc/src/mvcc/txn.rs#L327). Track the initial returned key and later returned keys.
 This records visited entries, not the range predicate or gaps. An empty scan records
 no key hashes; a concurrent insertion into that range may therefore go undetected.
 **Check:** Why does hashing returned keys fail to represent "no key exists in [a,z]"?
 
 ### Task 3: Engine Interface and Serializable Validation
 
-Read [Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L124) → [LsmStorageInner::write_batch](mini-lsm-mvcc/src/lsm_storage.rs#L650) →
-[LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L610). Hold `commit_lock` across validation,
+Read [Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L127) → [LsmStorageInner::write_batch](mini-lsm-mvcc/src/lsm_storage.rs#L676) →
+[LsmStorageInner::write_batch_inner](mini-lsm-mvcc/src/lsm_storage.rs#L629). Hold `commit_lock` across validation,
 publication, and insertion of the committed write-set record. Intersect this
 transaction's reads with writes committed after its `read_ts`. Ordinary engine
 writes must participate in that history when validation is enabled.
+`commit_lock` releases on return. Hash-set/history guards use smaller nested scopes:
+validation releases them before publication; registration reacquires them afterward.
+A post-publication freeze error can return before history registration, so the code
+has no general rollback or continued-validation guarantee after that I/O failure.
 
 T1 reads b/writes a; T2 reads a/writes b; both start at 10. If T1 commits at 11,
 T2's read(a) intersects T1's write(a), so T2 aborts without publication. Two blind
@@ -307,7 +327,7 @@ writes can instead serialize by commit order. Read-only commits skip validation.
 ### Task 4: Garbage Collection
 
 Read the `committed_txns` insertion and watermark cleanup at the end of
-[Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L124), then [LsmMvccInner::watermark](mini-lsm-mvcc/src/mvcc.rs#L71). Remove commit-history
+[Transaction::commit](mini-lsm-mvcc/src/mvcc/txn.rs#L127), then [LsmMvccInner::watermark](mini-lsm-mvcc/src/mvcc.rs#L75). Remove commit-history
 records strictly below the watermark. This reclaims conflict metadata, not SST
 versions; version GC has the separate per-key baseline rule from Day 4.
 **Check:** Why can an old live transaction keep both history metadata and old values alive?
@@ -326,8 +346,8 @@ removing a key prefix while compaction rewrites files.
 
 ### Task 1: Compaction Filter
 
-Read [CompactionFilter](mini-lsm-mvcc/src/lsm_storage.rs#L197) → [MiniLsm::add_compaction_filter](mini-lsm-mvcc/src/lsm_storage.rs#L296) →
-[LsmStorageInner::add_compaction_filter](mini-lsm-mvcc/src/lsm_storage.rs#L512) →
+Read [CompactionFilter](mini-lsm-mvcc/src/lsm_storage.rs#L197) → [MiniLsm::add_compaction_filter](mini-lsm-mvcc/src/lsm_storage.rs#L306) →
+[LsmStorageInner::add_compaction_filter](mini-lsm-mvcc/src/lsm_storage.rs#L525) →
 [LsmStorageInner::compact_generate_sst_from_iter](mini-lsm-mvcc/src/compact.rs#L130). Registering the prefix
 stores policy; it does not immediately rewrite files or free space. The compactor
 keeps versions above the watermark and filters the baseline at or below it along

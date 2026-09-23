@@ -8,6 +8,9 @@ the **compactor merges and rewrites them**; the **installation and recovery path
 records which files form the live database**. A WAL records unflushed user writes.
 A manifest records layout changes. Neither substitutes for the other.
 
+For lock acquisition/release, ownership, preconditions, and error boundaries, keep
+[Locks, ownership, and guarantees](LOCKING_AND_INVARIANTS.md) open alongside this guide.
+
 ## Day 1 — Compaction Implementation
 
 Book: [Compaction Implementation](mini-lsm-book/src/week2-01-compaction.md#compaction-implementation). Goal: rewrite multiple sources into fewer
@@ -39,7 +42,7 @@ continue at `m`. Overlapping L0 files cannot use this shortcut.
 
 ### Task 3: Integrate with the Read Path
 
-Read [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808) and [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517), focusing on their
+Read [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842) and [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536), focusing on their
 `level_iters` loops, then [LsmIteratorInner](mini-lsm/src/lsm_iterator.rs#L30). Concatenate files **within** a
 level/tier; merge streams **across** levels/tiers; put the memory/L0 group ahead
 of these older sources. The extra nesting changes physical source coverage, not
@@ -72,11 +75,14 @@ L0 as `[9]`, not `[]`. Removal uses the task's exact ids against the current sta
 
 ### Task 2: Compaction Thread
 
-Read [LsmStorageInner::spawn_compaction_thread](mini-lsm/src/compact.rs#L412) →
-[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L348) → [CompactionController::generate_compaction_task](mini-lsm/src/compact.rs#L70)
+Read [LsmStorageInner::spawn_compaction_thread](mini-lsm/src/compact.rs#L419) →
+[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L352) → [CompactionController::generate_compaction_task](mini-lsm/src/compact.rs#L70)
 → [CompactionController::apply_compaction_result](mini-lsm/src/compact.rs#L85). Planning uses a cloned
 layout; expensive file construction runs outside the state RwLock; installation
-acquires the structural lock and rereads the current state.
+acquires the structural lock and rereads the current state. The read guard used to
+clone it releases at that statement; the publication write guard is explicitly
+dropped before manifest I/O. The structural guard survives until the installation
+block ends, before old file deletion. See the [compaction sequence](LOCKING_AND_INVARIANTS.md#5-flush-and-compaction-have-different-lock-lifetimes).
 
 Follow output creation → publish replacement layout → sync directory/manifest →
 delete obsolete inputs. The manifest must refer to available output files before
@@ -85,7 +91,7 @@ lose a flush that completed during the file build?
 
 ### Task 3: Integrate with the Read Path
 
-Revisit [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808) and [SstConcatIterator::create_and_seek_to_first](mini-lsm/src/iterators/concat_iterator.rs#L48).
+Revisit [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842) and [SstConcatIterator::create_and_seek_to_first](mini-lsm/src/iterators/concat_iterator.rs#L48).
 Now several levels may contain candidates. Each contributes a sorted run; earlier
 levels win equal keys. The concat invariant depends on compaction producing sorted,
 disjoint output files and result application preserving their order.
@@ -109,7 +115,7 @@ This implementation estimates run sizes by file count.
 #### Task 1.0: Precondition
 
 Start at [TieredCompactionController::generate_compaction_task](mini-lsm/src/compact/tiered.rs#L45) and compare
-[CompactionController::flush_to_l0](mini-lsm/src/compact.rs#L108) with [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L742).
+[CompactionController::flush_to_l0](mini-lsm/src/compact.rs#L108) with [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L773).
 Tiered flushing creates a new tier at the front. L0 must remain empty. The scheduler
 returns early until the configured number of tiers is present.
 **Check:** Why would also adding the file to L0 read the same source twice?
@@ -141,7 +147,7 @@ insert the replacement at the selected runs' position. Empty output is allowed.
 ### Task 2: Integrate with the Read Path
 
 Read the tiered arm of [LsmStorageInner::compact](mini-lsm/src/compact.rs#L190) and the level/tier loop in
-[LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808). A tier can contain several disjoint SSTs, so concatenate
+[LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842). A tier can contain several disjoint SSTs, so concatenate
 within each tier. Different tiers overlap, so merge them newest first.
 **Check:** Why is a tier id not a user-key ordering for its files?
 
@@ -170,22 +176,22 @@ for sufficiently shallow levels stay zero rather than demanding data at every le
 
 #### Task 1.2: Decide Base Level
 
-Read [base-level calculation](mini-lsm/src/compact/leveled.rs#L103)
-then [L0 destination selection](mini-lsm/src/compact/leveled.rs#L117).
+Read [base-level calculation](mini-lsm/src/compact/leveled.rs#L104)
+then [L0 destination selection](mini-lsm/src/compact/leveled.rs#L118).
 The shallowest positive target is the base level. For four levels, bottom=1000 MB,
 base size=100 MB, multiplier=10, targets become `[0,0,100,1000]`: L0 enters L3.
 **Check:** Why would always flushing L0 into L1 defeat these dynamic targets?
 
 #### Task 1.3: Decide Level Priorities
 
-Read [priority scoring](mini-lsm/src/compact/leveled.rs#L133). Score each level
+Read [priority scoring](mini-lsm/src/compact/leveled.rs#L134). Score each level
 as `actual/target`, keep scores above 1, and select the highest. L0's count trigger
 has already been considered first. A level with score 2 is twice its target size.
 **Check:** Why is comparing absolute byte sizes a different scheduling policy?
 
 #### Task 1.4: Select SST to Compact
 
-Read [oldest-SST selection](mini-lsm/src/compact/leveled.rs#L159) →
+Read [oldest-SST selection](mini-lsm/src/compact/leveled.rs#L160) →
 [LeveledCompactionController::find_overlapping_ssts](mini-lsm/src/compact/leveled.rs#L48). Select the oldest SST id
 in the chosen level, then include lower-level tables touching its key interval.
 For input `[b,f]`, lower `[e,h]` participates and `[i,m]` does not.
@@ -193,8 +199,8 @@ For input `[b,f]`, lower `[e,h]` participates and `[i,m]` does not.
 
 ### Task 2: Integrate Leveled Compaction
 
-Read [LeveledCompactionController::apply_compaction_result](mini-lsm/src/compact/leveled.rs#L179) →
-[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L348) → [LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L362). Remove only
+Read [LeveledCompactionController::apply_compaction_result](mini-lsm/src/compact/leveled.rs#L180) →
+[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L352) → [LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L375). Remove only
 selected ids, add outputs, and sort the lower level by first key. During recovery,
 tables have not been opened yet, so sorting waits until their metadata is available.
 **Check:** Why does the installer add output objects to `sstables` before applying
@@ -212,7 +218,7 @@ restart. Directory contents alone cannot identify which SSTs are still live.
 
 ### Task 1: Manifest Encoding
 
-Read [ManifestRecord](mini-lsm/src/manifest.rs#L32) → [Manifest::add_record_when_init](mini-lsm/src/manifest.rs#L139) → [Manifest::recover](mini-lsm/src/manifest.rs#L54).
+Read [ManifestRecord](mini-lsm/src/manifest.rs#L32) → [Manifest::add_record_when_init](mini-lsm/src/manifest.rs#L142) → [Manifest::recover](mini-lsm/src/manifest.rs#L54).
 Records describe new memtables, completed flushes, and compaction replacements.
 Each frame is `body length:u64 | JSON body | CRC:u32`. Recovery replays complete
 validated frames, truncates an incomplete final frame, and rejects a complete
@@ -222,23 +228,29 @@ frame with a bad checksum.
 ### Task 2: Write Manifests
 
 Read [Manifest::add_record](mini-lsm/src/manifest.rs#L131) and its callers in
-[LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L714),
-[LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L742), and
-[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L348). Trace which files are created/synced
+[LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L743),
+[LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L773), and
+[LsmStorageInner::trigger_compaction](mini-lsm/src/compact.rs#L352). Trace which files are created/synced
 before recording an edit and which old files are deleted afterward. The passed
-`MutexGuard` indicates that structural updates are serialized across this sequence.
+`MutexGuard` is borrowed from the caller, which continues to own the structural
+lock. `add_record_when_init` additionally acquires the manifest file mutex through
+append and `sync_all`, releasing it on return. The guard type cannot itself prove
+that the caller passed this engine's mutex. See [persistence locks](LOCKING_AND_INVARIANTS.md#6-persistence-workers-and-shutdown).
 **Check:** After a crash before the manifest edit, which layout will recovery choose?
 
 ### Task 3: Flush on Close
 
-Read [MiniLsm::close](mini-lsm/src/lsm_storage.rs#L234). Stop and join workers before final persistence. Without
+Read [MiniLsm::close](mini-lsm/src/lsm_storage.rs#L239). Stop and join workers before final persistence. Without
 WAL, freeze current memory and flush all immutable maps; with WAL, the later path
 syncs the log instead. Explicit `close()` does more than the handle's `Drop`.
+Foreground callers must stop operations before closing; joining workers does not
+prevent new writes through another handle. Worker-handle mutexes protect joining,
+and their named guards release when `close` returns.
 **Check:** Why does merely notifying background threads not establish persistence?
 
 ### Task 4: Recover from the State
 
-Read [LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L362), first the manifest replay loop, then the SST-open
+Read [LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L375), first the manifest replay loop, then the SST-open
 loop, then the WAL/memtable reconstruction. `NewMemtable(7)` adds a pending memory
 source; `Flush(7)` removes that pending id and adds an SST; a compaction record
 replaces selected ids. Open surviving SSTs only after replay determines the layout.
@@ -256,26 +268,30 @@ The manifest identifies which WALs matter; each WAL supplies their data records.
 
 ### Task 1: WAL Encoding
 
-Read [Wal::put](mini-lsm/src/wal.rs#L115) → [Wal::recover](mini-lsm/src/wal.rs#L46) → [Wal::sync](mini-lsm/src/wal.rs#L145). The Week 2 record is
+Read [Wal::put](mini-lsm/src/wal.rs#L115) → [Wal::recover](mini-lsm/src/wal.rs#L46) → [Wal::sync](mini-lsm/src/wal.rs#L148). The Week 2 record is
 `key_len:u16 | key | value_len:u16 | value | CRC:u32`. Replay in append order so
 later records replace earlier ones. A zero-length value replays as a tombstone.
 `put` writes through `BufWriter`; `sync` flushes that buffer and syncs the file.
+Both hold the WAL file mutex to their return. Engine `sync` also holds the structural
+mutex and a state read guard; with WAL disabled its WAL step is a no-op, not an SST flush.
 **Check:** Why is successful append not the same guarantee as successful sync?
 
 ### Task 2: Integrate WALs
 
 Read [MemTable::create_with_wal](mini-lsm/src/mem_table.rs#L65) → [MemTable::put](mini-lsm/src/mem_table.rs#L115) →
-[LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L714) → [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L742).
+[LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L743) → [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L773).
 Each memtable owns a WAL with the same id. Rotation creates a new WAL; successful
 flush makes the old WAL unnecessary only after the SST and manifest record are safe.
 The Week 2 `put` mutates memory before its WAL call; Week 3's batch path changes
-that ordering and adds atomic publication. Do not infer Week 3 guarantees here.
+that ordering and adds atomic publication. A Week 2 WAL error can follow a memory
+update, and concurrent puts can order memory changes and WAL appends differently.
+The WAL mutex serializes file access, not the combined map/log operation.
 **Check:** Why must the old WAL survive until its flush is recorded?
 
 ### Task 3: Recover from the WALs
 
 Read [MemTable::recover_from_wal](mini-lsm/src/mem_table.rs#L75) → [Wal::recover](mini-lsm/src/wal.rs#L46) →
-[LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L362). Manifest replay identifies unflushed ids; replay their
+[LsmStorageInner::open](mini-lsm/src/lsm_storage.rs#L375). Manifest replay identifies unflushed ids; replay their
 WALs into immutable maps and create a new writable map. Incomplete trailing records
 are truncated so a future append does not follow uninterpretable tail bytes.
 **Check:** With a valid record A followed by half of B, which record can be recovered?
@@ -292,7 +308,7 @@ persistent bytes. Checksums and structural validation solve different problems.
 
 ### Task 1: Write Batch Interface
 
-Read [WriteBatchRecord](mini-lsm/src/lsm_storage.rs#L64) → [validate_write_batch](mini-lsm/src/lsm_storage.rs#L69) → [LsmStorageInner::write_batch](mini-lsm/src/lsm_storage.rs#L611).
+Read [WriteBatchRecord](mini-lsm/src/lsm_storage.rs#L64) → [validate_write_batch](mini-lsm/src/lsm_storage.rs#L69) → [LsmStorageInner::write_batch](mini-lsm/src/lsm_storage.rs#L630).
 The API accepts puts and deletes in sequence. Validate field widths before the
 loop; each entry then uses the current memtable and may trigger a freeze. This
 Week 2 batch is **not atomic** for concurrent readers or crash recovery.
@@ -323,7 +339,7 @@ whole frame. This is record-level validation; Week 3 extends it to whole batches
 
 ### Task 5: Manifest Checksum
 
-Read [Manifest::add_record_when_init](mini-lsm/src/manifest.rs#L139) → [Manifest::recover](mini-lsm/src/manifest.rs#L54). The checksum
+Read [Manifest::add_record_when_init](mini-lsm/src/manifest.rs#L142) → [Manifest::recover](mini-lsm/src/manifest.rs#L54). The checksum
 covers the JSON body; the u64 framing length is outside that checksum and is
 separately checked before slicing. A valid prefix can survive a torn final append,
 while an invalid complete body must fail recovery.

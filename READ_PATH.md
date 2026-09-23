@@ -5,6 +5,9 @@ that duplicate resolution applies to ordinary values as well as tombstones. Ever
 function link opens the corresponding annotated code in this checkout.
 The longer companion is [mini-lsm/READ_PATH.md](mini-lsm/READ_PATH.md).
 
+For exact guard lifetimes and reusable contracts, read
+[locks, ownership, and guarantees](LOCKING_AND_INVARIANTS.md).
+
 ## 1. Understand the sources a read searches
 
 Start with [LsmStorageState](mini-lsm/src/lsm_storage.rs#L49). Follow the fields: current memtable → immutable
@@ -14,11 +17,15 @@ The order matters when several sources contain the same key. The `sstables` map
 only looks up table objects; the vectors determine priority. Distinguish a snapshot
 of this source layout from a snapshot of actual values: the current memtable can
 still change. Week 3 later introduces timestamped snapshots.
+In both `get` and `scan`, `state.read()` acquires the layout read lock, the block
+clones its Arc, and the closing brace releases the guard. Memory/disk reads and
+returned scan iteration then proceed without retaining that state guard. The Arc
+keeps objects alive; it does not keep a lock acquired.
 
 ## 2. Understand how one memory source is read
 
-Read [StorageIterator](mini-lsm/src/iterators.rs#L22), then [MemTable::get](mini-lsm/src/mem_table.rs#L106), [MemTable::scan](mini-lsm/src/mem_table.rs#L144), and
-[MemTableIterator::next](mini-lsm/src/mem_table.rs#L229).
+Read [StorageIterator](mini-lsm/src/iterators.rs#L25), then [MemTable::get](mini-lsm/src/mem_table.rs#L106), [MemTable::scan](mini-lsm/src/mem_table.rs#L149), and
+[MemTableIterator::next](mini-lsm/src/mem_table.rs#L234).
 
 A cursor is already positioned when returned: check `is_valid()`, read its key and
 value, then advance. An empty **value** represents deletion; an empty **key** marks
@@ -27,7 +34,7 @@ searching older sources; `Some(empty)` is an authoritative deletion.
 
 ## 3. Understand merging several sources of the same type
 
-Read [HeapWrapper::cmp](mini-lsm/src/iterators/merge_iterator.rs#L44) → [MergeIterator::create](mini-lsm/src/iterators/merge_iterator.rs#L65) → [MergeIterator::next](mini-lsm/src/iterators/merge_iterator.rs#L121).
+Read [HeapWrapper::cmp](mini-lsm/src/iterators/merge_iterator.rs#L44) → [MergeIterator::create](mini-lsm/src/iterators/merge_iterator.rs#L67) → [MergeIterator::next](mini-lsm/src/iterators/merge_iterator.rs#L123).
 
 Focus on two separate rules: **smaller keys come first; source priority breaks
 equal-key ties**. The comments explain the reversed heap comparison and trace how
@@ -38,13 +45,16 @@ For input 0 `[b:9,d:4]` and input 1 `[a:1,b:2,c:3]`, output is
 
 ## 4. Book Task 1: merge memory and disk cursors
 
-Read [TwoMergeIterator::create](mini-lsm/src/iterators/two_merge_iterator.rs#L66) → [TwoMergeIterator::skip_b](mini-lsm/src/iterators/two_merge_iterator.rs#L50) →
-[TwoMergeIterator::choose_a](mini-lsm/src/iterators/two_merge_iterator.rs#L37) → [TwoMergeIterator::next](mini-lsm/src/iterators/two_merge_iterator.rs#L112).
+Read [TwoMergeIterator::create](mini-lsm/src/iterators/two_merge_iterator.rs#L69) → [TwoMergeIterator::skip_b](mini-lsm/src/iterators/two_merge_iterator.rs#L52) →
+[TwoMergeIterator::choose_a](mini-lsm/src/iterators/two_merge_iterator.rs#L39) → [TwoMergeIterator::next](mini-lsm/src/iterators/two_merge_iterator.rs#L115).
 
 A and B can be different cursor types. When their keys are equal, A wins because
 the caller supplied it as the higher-priority input. `skip_b` advances B past its
 copy so the merged stream will emit the key only once. It does not inspect values
-or decide source recency itself.
+or decide source recency itself. Both children must already be sorted and unique
+by their exposed key; that precondition is why advancing B once is sufficient.
+The same primitive merges compaction inputs. In Week 3, raw merges compare full
+`(user key, timestamp)` keys, while transaction overlays compare user-key bytes.
 
 Trace A=`[b:9,d:4]`, B=`[b:2,c:3]`: B advances to c while A remains at b; the output
 is `[b:9,c:3,d:4]`. This is the general rule for an overwrite.
@@ -69,14 +79,14 @@ uses the block's first key, so a binary-search probe can decode an entry directl
 
 ## 6. Book Task 2: assemble the scan
 
-Start at [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808). Read its annotated stages in order:
+Start at [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842). Read its annotated stages in order:
 
-1. [Capture the source layout](mini-lsm/src/lsm_storage.rs#L816).
-2. [Build memory cursors](mini-lsm/src/lsm_storage.rs#L823).
-3. [Build L0 cursors](mini-lsm/src/lsm_storage.rs#L834).
-4. [Build level/tier cursors](mini-lsm/src/lsm_storage.rs#L871).
-5. [Merge source groups](mini-lsm/src/lsm_storage.rs#L908).
-6. [Wrap the result](mini-lsm/src/lsm_storage.rs#L913).
+1. [Capture the source layout](mini-lsm/src/lsm_storage.rs#L850).
+2. [Build memory cursors](mini-lsm/src/lsm_storage.rs#L857).
+3. [Build L0 cursors](mini-lsm/src/lsm_storage.rs#L868).
+4. [Build level/tier cursors](mini-lsm/src/lsm_storage.rs#L905).
+5. [Merge source groups](mini-lsm/src/lsm_storage.rs#L942).
+6. [Wrap the result](mini-lsm/src/lsm_storage.rs#L947).
 
 Pay attention to the excluded lower bound: if seeking b lands on b, advance; if
 it lands on c, keep c. [range_overlap](mini-lsm/src/lsm_storage.rs#L158) only selects possible tables; it does
@@ -99,17 +109,18 @@ children may have advanced before that failure.
 
 ## 8. Book Task 3: follow a point lookup end to end
 
-Read [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517), particularly the
-[candidate-table filter](mini-lsm/src/lsm_storage.rs#L549) and
-[final result check](mini-lsm/src/lsm_storage.rs#L599).
+Read [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536), particularly the
+[candidate-table filter](mini-lsm/src/lsm_storage.rs#L568) and
+[final result check](mini-lsm/src/lsm_storage.rs#L618).
 
 Memory is checked directly, newest first. A value or a tombstone ends the lookup.
 Disk candidates are sought and merged, then the final condition requires a valid
 cursor, **exact key equality**, and a nonempty value. Bloom filters only prune
 impossible candidates; positive membership is not proof of a match.
 
-The returned value is copied into owned `Bytes`, so it remains valid when the
-temporary disk cursor and its borrowed block value go away.
+A disk result is copied into owned `Bytes`, so it remains valid when the temporary
+cursor and its borrowed block value go away. Memory results instead clone a `Bytes`
+handle, sharing its already-owned byte buffer.
 
 ## 9. Read the annotated tests as complete examples
 

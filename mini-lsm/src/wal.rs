@@ -115,9 +115,12 @@ impl Wal {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Record = key_len:u16 | key | value_len:u16 | value | CRC:u32.
         // CRC covers the encoded lengths as well as payloads. One successful
-        // append only reaches BufWriter here; sync() establishes durable storage.
+        // append uses BufWriter and may write to the OS, but does not sync the
+        // file. Successful sync() supplies the file durability boundary.
         let key_len = u16::try_from(key.len()).context("WAL key is too large")?;
         let value_len = u16::try_from(value.len()).context("WAL value is too large")?;
+        // Acquire the WAL file mutex until return, including `?` error exits.
+        // It serializes this file's append/sync operations, not skipmap mutations.
         let mut file = self.file.lock();
         let mut buf: Vec<u8> = Vec::with_capacity(
             key.len() + value.len() + std::mem::size_of::<u16>() * 2 + std::mem::size_of::<u32>(),
@@ -145,6 +148,8 @@ impl Wal {
     pub fn sync(&self) -> Result<()> {
         // flush() moves bytes out of the userspace buffer; sync_all() asks the OS
         // to persist the file. Those are separate steps with different guarantees.
+        // Acquire the WAL file mutex until return, including `?` error exits.
+        // It serializes this file's append/sync operations, not skipmap mutations.
         let mut file = self.file.lock();
         file.flush()?;
         file.get_mut().sync_all()?;

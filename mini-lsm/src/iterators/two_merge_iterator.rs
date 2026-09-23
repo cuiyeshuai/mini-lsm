@@ -19,9 +19,11 @@ use super::StorageIterator;
 /// Merges two iterators of different types into one. If the two iterators have the same key, only
 /// produce the key once and prefer the entry from A.
 ///
-/// Read-path example: A is merged memory, B is merged L0. Both children are
-/// sorted and already unique by key. We store two cursors, not a combined array;
-/// key()/value() borrow the current winner and next() advances the merge lazily.
+/// Contract: each child is positioned, sorted, and unique by its exposed key
+/// type. Source priority comes from the caller: A wins ties, irrespective of value.
+/// This works for memory versus SST reads and upper versus lower compaction inputs.
+/// We store cursors; key()/value() borrow the winner and next() advances lazily.
+/// No engine lock is acquired here, although child operations can perform I/O.
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
@@ -55,8 +57,9 @@ impl<
         // The full output is [b:9,c:3,d:4], with b emitted only once.
         // Each child already emits unique keys, so one step removes the duplicate.
         // A deletion follows exactly the same rule: if A's b holds a tombstone,
-        // retain it here and discard B's b. LsmIterator later hides the tombstone
-        // after merging has suppressed the older entry.
+        // retain it here and discard B's b. The consumer decides its meaning:
+        // read wrappers hide it; compaction may need to retain it in a new SST.
+        // This helper itself neither removes tombstones nor selects visible versions.
         if self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
             self.b.next()?;
         }

@@ -7,7 +7,7 @@ annotated source code and task-by-task reading guides for all three weeks of
 [Alex Chi's Mini-LSM course](https://github.com/skyzh/mini-lsm). Original attribution
 and licenses are preserved.
 
-**[Start with the annotated code roadmap](READING_ROADMAP.md)** · **[Read-path walkthrough](READ_PATH.md)**
+**[Start with the annotated code roadmap](READING_ROADMAP.md)** · **[Read-path walkthrough](READ_PATH.md)** · **[Locks and guarantees](LOCKING_AND_INVARIANTS.md)**
 
 [![CI (main)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml)
 

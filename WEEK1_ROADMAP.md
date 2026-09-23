@@ -10,6 +10,9 @@ SSTs → merge memory and disk for reads**. A merge first orders keys and resolv
 conflicting copies; a visibility wrapper subsequently removes winning tombstones.
 Deletion is one application of the merge rule, not the merge's primary purpose.
 
+For lock acquisition/release, ownership, preconditions, and error boundaries, keep
+[Locks, ownership, and guarantees](LOCKING_AND_INVARIANTS.md) open alongside this guide.
+
 ## Day 1 — Memtables
 
 Book: [Memtables](mini-lsm-book/src/week1-01-memtable.md#memtables). Goal: keep a latest value in memory and rotate
@@ -28,30 +31,35 @@ both puts, so it estimates submitted data rather than current live memory exactl
 
 ### Task 2: A Single Memtable in the Engine
 
-Read [LsmStorageState::create](mini-lsm/src/lsm_storage.rs#L88) → [LsmStorageInner::put](mini-lsm/src/lsm_storage.rs#L648) →
-[LsmStorageInner::write_batch](mini-lsm/src/lsm_storage.rs#L611) → [MemTable::put](mini-lsm/src/mem_table.rs#L115). Skim
-[LsmStorageInner::delete](mini-lsm/src/lsm_storage.rs#L653) to see the tombstone representation.
+Read [LsmStorageState::create](mini-lsm/src/lsm_storage.rs#L88) → [LsmStorageInner::put](mini-lsm/src/lsm_storage.rs#L671) →
+[LsmStorageInner::write_batch](mini-lsm/src/lsm_storage.rs#L630) → [MemTable::put](mini-lsm/src/mem_table.rs#L115). Skim
+[LsmStorageInner::delete](mini-lsm/src/lsm_storage.rs#L676) to see the tombstone representation.
 The current solution routes single writes through the later batch API. Follow one
 `Put` branch and the short `state.read()` guard around the memtable mutation;
 that guard prevents a structural swap from moving this write into the wrong map.
+It covers map mutation and optional WAL append, then releases at the inner block's
+end, before `try_freeze`. Other writers can hold read guards concurrently; this is
+not a writer-serialization mutex. See the [write sequence](LOCKING_AND_INVARIANTS.md#4-writes-and-freeze-why-dropping-the-read-guard-matters).
 **Check:** Where does the public engine reject an empty ordinary value?
 
 ### Task 3: Write Path - Freezing a Memtable
 
-Read [LsmStorageInner::try_freeze](mini-lsm/src/lsm_storage.rs#L657) → [LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L714)
-→ [LsmStorageInner::freeze_memtable_with_memtable](mini-lsm/src/lsm_storage.rs#L694). The first checks capacity;
+Read [LsmStorageInner::try_freeze](mini-lsm/src/lsm_storage.rs#L680) → [LsmStorageInner::force_freeze_memtable](mini-lsm/src/lsm_storage.rs#L743)
+→ [LsmStorageInner::freeze_memtable_with_memtable](mini-lsm/src/lsm_storage.rs#L720). The first checks capacity;
 the second creates a replacement and handles its persistence metadata; the third
 publishes the layout change. First understand the swap, then revisit WAL/manifest
 steps in Week 2.
 
 A freeze changes `current=A, immutable=[B]` into `current=C, immutable=[A,B]`.
 It performs no SST construction. Notice the size recheck after `state_lock` and
-the read guard being dropped before the write guard is acquired.
+the read guard being dropped before the write guard is acquired. The structural
+mutex remains held through replacement creation, the swap, and old-WAL sync, then
+releases at `try_freeze`'s outer `if` block. The helper borrows that existing guard.
 **Check:** How does a second writer avoid freezing a fresh, nearly empty map?
 
 ### Task 4: Read Path - Get
 
-Read the memory-probing portion of [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517). Stop at the SST
+Read the memory-probing portion of [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536). Stop at the SST
 candidate loop on this first pass. Current memory wins; then immutable maps are
 searched newest to oldest. Return on the first occurrence, regardless of whether
 it contains a value or a tombstone.
@@ -71,8 +79,8 @@ several sorted memory maps without materializing all their entries.
 
 ### Task 1: Memtable Iterator
 
-Read [StorageIterator](mini-lsm/src/iterators.rs#L22) → [map_bound](mini-lsm/src/mem_table.rs#L43) → [MemTable::scan](mini-lsm/src/mem_table.rs#L144) →
-[MemTableIterator::entry_to_item](mini-lsm/src/mem_table.rs#L206) → [MemTableIterator::next](mini-lsm/src/mem_table.rs#L229).
+Read [StorageIterator](mini-lsm/src/iterators.rs#L25) → [map_bound](mini-lsm/src/mem_table.rs#L43) → [MemTable::scan](mini-lsm/src/mem_table.rs#L149) →
+[MemTableIterator::entry_to_item](mini-lsm/src/mem_table.rs#L211) → [MemTableIterator::next](mini-lsm/src/mem_table.rs#L234).
 The constructor owns its range bounds, retains the map through an `Arc`, and primes
 the cursor once before returning. `ouroboros` manages the range iterator borrowing
 the map stored inside the same structure. You can defer macro mechanics initially.
@@ -80,9 +88,11 @@ the map stored inside the same structure. You can defer macro mechanics initiall
 
 ### Task 2: Merge Iterator
 
-Read [HeapWrapper::cmp](mini-lsm/src/iterators/merge_iterator.rs#L44) → [MergeIterator::create](mini-lsm/src/iterators/merge_iterator.rs#L65) → [MergeIterator::next](mini-lsm/src/iterators/merge_iterator.rs#L121).
+Read [HeapWrapper::cmp](mini-lsm/src/iterators/merge_iterator.rs#L44) → [MergeIterator::create](mini-lsm/src/iterators/merge_iterator.rs#L67) → [MergeIterator::next](mini-lsm/src/iterators/merge_iterator.rs#L123).
 Comparison is by key first, input index second, reversed for Rust's max-heap.
-Recency is encoded by the caller's input ordering, not inferred from a value or id.
+Each child must already be sorted and unique by its exposed key. Input position
+supplies tie priority; read-path callers use it to encode recency. The merge itself
+infers no recency from values or ids and is also used in compaction.
 `current` holds the winner outside the heap; `next` consumes competing equal keys
 before advancing it and choosing the next winner.
 
@@ -103,7 +113,7 @@ an error continue to fail?
 
 ### Task 4: Read Path - Scan
 
-Read the memory-cursor construction in [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808), then
+Read the memory-cursor construction in [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842), then
 [LsmIteratorInner](mini-lsm/src/lsm_iterator.rs#L30) to see how the later disk sources extend that same design.
 Each source handles its own starting position; the merge only compares current
 entries and advances children as needed. Keep memory inputs newest first.
@@ -122,7 +132,7 @@ small independently searchable unit. Builders consume sorted input; they do not 
 
 ### Task 1: Block Builder
 
-Read [BlockBuilder::new](mini-lsm/src/block/builder.rs#L51) → [BlockBuilder::add](mini-lsm/src/block/builder.rs#L67) → [BlockBuilder::build](mini-lsm/src/block/builder.rs#L125)
+Read [BlockBuilder::new](mini-lsm/src/block/builder.rs#L51) → [BlockBuilder::add](mini-lsm/src/block/builder.rs#L67) → [BlockBuilder::build](mini-lsm/src/block/builder.rs#L127)
 → [Block::encode](mini-lsm/src/block.rs#L33) → [Block::decode_checked](mini-lsm/src/block.rs#L51).
 Track two buffers: encoded entries and their u16 offsets. The encoded block ends
 with the offsets and then the entry count, so decoding can locate the index from
@@ -198,15 +208,18 @@ at [READ_PATH.md](READ_PATH.md). The expanded background guide remains at
 
 ### Task 1: Two Merge Iterator
 
-Read [TwoMergeIterator::create](mini-lsm/src/iterators/two_merge_iterator.rs#L66) → [TwoMergeIterator::skip_b](mini-lsm/src/iterators/two_merge_iterator.rs#L50) →
-[TwoMergeIterator::choose_a](mini-lsm/src/iterators/two_merge_iterator.rs#L37) → [TwoMergeIterator::next](mini-lsm/src/iterators/two_merge_iterator.rs#L112). A and B may have
+Read [TwoMergeIterator::create](mini-lsm/src/iterators/two_merge_iterator.rs#L69) → [TwoMergeIterator::skip_b](mini-lsm/src/iterators/two_merge_iterator.rs#L52) →
+[TwoMergeIterator::choose_a](mini-lsm/src/iterators/two_merge_iterator.rs#L39) → [TwoMergeIterator::next](mini-lsm/src/iterators/two_merge_iterator.rs#L115). A and B may have
 different cursor types but comparable key types. Equal keys select A because B's
 copy is advanced first. This applies to ordinary overwrites and deletes alike.
+Each child must be sorted and individually unique by that key type; otherwise one
+B advance need not remove the conflict. Consumers decide what to do with a winning
+tombstone: a scan hides it, while compaction may need to retain it.
 **Check:** Merge A=`[b:9,d:4]`, B=`[b:2,c:3]`; why can `choose_a` use strict `<`?
 
 ### Task 2: Read Path - Scan
 
-Read [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808) → [range_overlap](mini-lsm/src/lsm_storage.rs#L158) → [LsmIterator::new](mini-lsm/src/lsm_iterator.rs#L44)
+Read [LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842) → [range_overlap](mini-lsm/src/lsm_storage.rs#L158) → [LsmIterator::new](mini-lsm/src/lsm_iterator.rs#L44)
 → [LsmIterator::check_end_bound](mini-lsm/src/lsm_iterator.rs#L59) → [LsmIterator::move_to_non_delete](mini-lsm/src/lsm_iterator.rs#L85).
 Create each source cursor at the lower bound, merge with memory preferred over
 disk, enforce the upper bound, then expose live entries. The constructor checks
@@ -215,7 +228,7 @@ bounds too: seeking `[b,b]` in an SST `[a,c]` already lands out of range.
 
 ### Task 3: Read Path - Get
 
-Read [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517) → [MemTable::get](mini-lsm/src/mem_table.rs#L106) →
+Read [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536) → [MemTable::get](mini-lsm/src/mem_table.rs#L106) →
 [SsTableIterator::create_and_seek_to_key](mini-lsm/src/table/iterator.rs#L79). Memory returns on its first hit;
 disk sources are sought and merged. The final comparison must establish exact key
 equality as well as a nonempty value. Bounds/Bloom filtering only prune candidates.
@@ -233,7 +246,7 @@ with an equivalent SST and arrange for this to happen in the background.
 
 ### Task 1: Flush Memtable to SST
 
-Read [MemTable::flush](mini-lsm/src/mem_table.rs#L162) → [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L742)
+Read [MemTable::flush](mini-lsm/src/mem_table.rs#L167) → [LsmStorageInner::force_flush_next_imm_memtable](mini-lsm/src/lsm_storage.rs#L773)
 → [SsTableBuilder::build](mini-lsm/src/table/builder.rs#L100). The oldest immutable map is written in sorted order,
 including deletion markers. After the file is ready, the new state removes that
 memory source and installs the SST. WAL deletion and manifest updates are later
@@ -245,17 +258,20 @@ of L0 even though B is the oldest immutable map?
 
 ### Task 2: Flush Trigger
 
-Read [LsmStorageInner::try_freeze](mini-lsm/src/lsm_storage.rs#L657) → [LsmStorageInner::trigger_flush](mini-lsm/src/compact.rs#L437) →
-[LsmStorageInner::spawn_flush_thread](mini-lsm/src/compact.rs#L452) → [MiniLsm::open](mini-lsm/src/lsm_storage.rs#L283). Capacity rotates
+Read [LsmStorageInner::try_freeze](mini-lsm/src/lsm_storage.rs#L680) → [LsmStorageInner::trigger_flush](mini-lsm/src/compact.rs#L444) →
+[LsmStorageInner::spawn_flush_thread](mini-lsm/src/compact.rs#L459) → [MiniLsm::open](mini-lsm/src/lsm_storage.rs#L293). Capacity rotates
 the current memtable; immutable-map count triggers flushing. These are separate
-thresholds. The worker checks periodically and flushes one map per trigger.
+thresholds. The worker checks periodically and flushes one map per trigger. Flush holds
+`state_lock` for its whole call, but its selection read guard ends before building
+the SST and its installation write guard ends before recording the manifest.
+See the [flush sequence](LOCKING_AND_INVARIANTS.md#5-flush-and-compaction-have-different-lock-lifetimes).
 **Check:** Which lock stays held across flush construction, and which state lock is
 released before the expensive SST build?
 
 ### Task 3: Filter the SSTs
 
 Read [range_overlap](mini-lsm/src/lsm_storage.rs#L158) and [key_within](mini-lsm/src/lsm_storage.rs#L188), then their use in
-[LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L808) and [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517). An SST's first/last keys
+[LsmStorageInner::scan](mini-lsm/src/lsm_storage.rs#L842) and [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536). An SST's first/last keys
 allow rejecting it before creating a cursor or loading a block. This is only a
 candidate test: the table can contain gaps inside its overall range.
 
@@ -284,7 +300,7 @@ or only an unnecessary table read?
 ### Task 2: Integrate Bloom Filter on the Read Path
 
 Read [SsTableBuilder::add](mini-lsm/src/table/builder.rs#L53) → [SsTableBuilder::build](mini-lsm/src/table/builder.rs#L100) → [SsTable::open](mini-lsm/src/table.rs#L218)
-→ [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L517). Collect fingerprints during building, encode the
+→ [LsmStorageInner::get](mini-lsm/src/lsm_storage.rs#L536). Collect fingerprints during building, encode the
 filter in the file, recover it when opening, then consult it before seeking.
 Tombstone keys must be included too: otherwise skipping a table could resurrect
 an older value. Arbitrary range scans cannot be rejected with a point-membership probe.

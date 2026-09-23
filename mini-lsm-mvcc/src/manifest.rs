@@ -128,10 +128,15 @@ impl Manifest {
         _state_lock_observer: &MutexGuard<()>,
         record: ManifestRecord,
     ) -> Result<()> {
+        // Borrow the caller's structural guard, then acquire the file mutex in
+        // add_record_when_init. We do not release the caller's structural lock.
+        // The parameter's type alone cannot verify which mutex produced it.
         self.add_record_when_init(record)
     }
 
     pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        // Acquire the file mutex through serialization, append, and sync_all.
+        // Return (including any `?` error) drops it; partial I/O is not rolled back.
         let mut file = self.file.lock();
         let mut buf = serde_json::to_vec(&record)?;
         let hash = crc32fast::hash(&buf);

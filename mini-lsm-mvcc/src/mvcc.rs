@@ -43,6 +43,8 @@ pub(crate) struct LsmMvccInner {
     // covers conflict validation and history registration for transactions.
     pub(crate) write_lock: Mutex<()>,
     pub(crate) commit_lock: Mutex<()>,
+    // One mutex couples the published clock and active-reader registration.
+    // The registry entry outlives the guard; no mutex is held for a whole snapshot.
     pub(crate) ts: Arc<Mutex<(u64, Watermark)>>,
     pub(crate) committed_txns: Arc<Mutex<BTreeMap<u64, CommittedTxnData>>>,
 }
@@ -58,10 +60,12 @@ impl LsmMvccInner {
     }
 
     pub fn latest_commit_ts(&self) -> u64 {
+        // Temporary guard: acquire, copy the clock, release on return.
         self.ts.lock().0
     }
 
     pub fn update_commit_ts(&self, ts: u64) {
+        // Temporary guard releases at the semicolon; caller still holds write_lock.
         self.ts.lock().0 = ts;
     }
 
@@ -69,6 +73,7 @@ impl LsmMvccInner {
     /// Compaction must still retain the newest version <= this watermark for each
     /// key; older versions may be removed when they are no longer needed.
     pub fn watermark(&self) -> u64 {
+        // Hold ts just while reading the registry/clock; release on return.
         let ts = self.ts.lock();
         ts.1.watermark().unwrap_or(ts.0)
     }
@@ -77,6 +82,8 @@ impl LsmMvccInner {
         // Capture read_ts and register its reader under the SAME mutex. Otherwise
         // GC could advance between those operations and discard data we need.
         // The transaction's eventual Drop unregisters it; clones share one lifetime.
+        // Acquire below and release when new_txn returns, after constructing the
+        // transaction. The reader count, NOT a held guard, protects its snapshot.
         let mut ts = self.ts.lock();
         let read_ts = ts.0;
         ts.1.add_reader(read_ts);

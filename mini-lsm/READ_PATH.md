@@ -14,10 +14,13 @@ input/output traces so you can follow cursor positions alongside the code.
 These source links reflect the current annotated files; function names remain
 the navigation reference if later edits move the code.
 
+For exact guard lifetimes and reusable contracts, read
+[locks, ownership, and guarantees](../LOCKING_AND_INVARIANTS.md).
+
 ## 0. Understand what a read must produce
 
 Read **[LsmStorageState](src/lsm_storage.rs#L49)** in [lsm_storage.rs](src/lsm_storage.rs), then skim
-**[MiniLsm::get](src/lsm_storage.rs#L302)** and **[MiniLsm::scan](src/lsm_storage.rs#L329)**. These public methods delegate to
+**[MiniLsm::get](src/lsm_storage.rs#L312)** and **[MiniLsm::scan](src/lsm_storage.rs#L339)**. These public methods delegate to
 `LsmStorageInner`, where the work happens.
 
 An SST is an immutable, sorted table on disk. A memtable is the in-memory sorted
@@ -44,17 +47,19 @@ Keep these rules in mind:
   the target while still producing a valid cursor.
 - Cloning the state `Arc` pins a consistent source layout and releases the state
   lock before disk I/O. It does **not** provide a point-in-time MVCC snapshot:
-  the current memtable remains shared and writable.
+  the current memtable remains shared and writable. `state.read()` acquires a
+  guard inside the snapshot block; its closing brace releases it. Keeping the Arc
+  does not keep that guard or acquire the separate structural `state_lock`.
 
 ## 1. Learn the cursor contract and memory source
 
 Read these in order:
 
-1. [iterators.rs](src/iterators.rs): **[StorageIterator](src/iterators.rs#L22)**, especially `is_valid`,
+1. [iterators.rs](src/iterators.rs): **[StorageIterator](src/iterators.rs#L25)**, especially `is_valid`,
    `key`, `value`, and `next`.
 2. [mem_table.rs](src/mem_table.rs): **[MemTable::get](src/mem_table.rs#L106)**, **[map_bound](src/mem_table.rs#L43)**,
-   **[MemTable::scan](src/mem_table.rs#L144)**.
-3. The same file: **[MemTableIterator::entry_to_item](src/mem_table.rs#L206)**, **[MemTableIterator::is_valid](src/mem_table.rs#L224)**, **[MemTableIterator::next](src/mem_table.rs#L229)**
+   **[MemTable::scan](src/mem_table.rs#L149)**.
+3. The same file: **[MemTableIterator::entry_to_item](src/mem_table.rs#L211)**, **[MemTableIterator::is_valid](src/mem_table.rs#L229)**, **[MemTableIterator::next](src/mem_table.rs#L234)**
    in its `StorageIterator` implementation.
 
 These iterators are cursors: construction already positions them at the first
@@ -79,27 +84,31 @@ First revisit the prerequisite in [merge_iterator.rs](src/iterators/merge_iterat
 
 1. **[HeapWrapper::cmp](src/iterators/merge_iterator.rs#L44)** — sorts by key, then original input index. The comparison
    is reversed because Rust's `BinaryHeap` puts the maximum at the top.
-2. **[MergeIterator::create](src/iterators/merge_iterator.rs#L65)** — keeps the winning cursor as `current` and the
+2. **[MergeIterator::create](src/iterators/merge_iterator.rs#L67)** — keeps the winning cursor as `current` and the
    competing cursors in a heap.
-3. **[MergeIterator::next](src/iterators/merge_iterator.rs#L121)** — advances competing copies of the current key,
+3. **[MergeIterator::next](src/iterators/merge_iterator.rs#L123)** — advances competing copies of the current key,
    advances the winner, and selects the next smallest key.
 
 This merges many cursors of the same type. The smaller input index wins ties,
-which is why the engine builds input vectors in source-priority order.
+which is why the engine builds input vectors in source-priority order. Each child
+must already be sorted and individually unique by its exposed key type.
 
 Then read [two_merge_iterator.rs](src/iterators/two_merge_iterator.rs):
 
-1. **[TwoMergeIterator::create](src/iterators/two_merge_iterator.rs#L66)**
-2. **[TwoMergeIterator::skip_b](src/iterators/two_merge_iterator.rs#L50)**
-3. **[TwoMergeIterator::choose_a](src/iterators/two_merge_iterator.rs#L37)**
-4. **[TwoMergeIterator::next](src/iterators/two_merge_iterator.rs#L112)**, then skim **[TwoMergeIterator::key](src/iterators/two_merge_iterator.rs#L88)**, **[TwoMergeIterator::value](src/iterators/two_merge_iterator.rs#L96)**, **[TwoMergeIterator::is_valid](src/iterators/two_merge_iterator.rs#L104)**
+1. **[TwoMergeIterator::create](src/iterators/two_merge_iterator.rs#L69)**
+2. **[TwoMergeIterator::skip_b](src/iterators/two_merge_iterator.rs#L52)**
+3. **[TwoMergeIterator::choose_a](src/iterators/two_merge_iterator.rs#L39)**
+4. **[TwoMergeIterator::next](src/iterators/two_merge_iterator.rs#L115)**, then skim **[TwoMergeIterator::key](src/iterators/two_merge_iterator.rs#L91)**, **[TwoMergeIterator::value](src/iterators/two_merge_iterator.rs#L99)**, **[TwoMergeIterator::is_valid](src/iterators/two_merge_iterator.rs#L107)**
 
 This merges two cursor types, such as memory and SST cursors. A wins equal keys:
 `skip_b` advances B past the duplicate before `choose_a` compares the remaining
 keys. This explains why `choose_a` can use `<` rather than `<=`.
 
 Both merge layers preserve tombstones. They resolve duplicate keys without
-deciding whether the winning entry should be visible to the caller.
+deciding whether the winning entry should be visible to the caller. Compaction
+also uses these merges; its consumer may retain a winning tombstone on disk.
+In Week 3 raw merges compare full `(user key, timestamp)` keys, so different
+versions survive; transaction overlays instead merge by user-key bytes.
 
 **Checkpoint:** First merge A = `[b:9, d:4]` with B = `[b:2, c:3]`: the
 output is `[b:9, c:3, d:4]`. This is ordinary duplicate resolution. Now replace
@@ -138,17 +147,17 @@ additional condition must `get(b)` check?
 
 ## 4. Assemble a range scan — book Task 2: Read Path - Scan
 
-Read **[LsmStorageInner::scan](src/lsm_storage.rs#L808)** in [lsm_storage.rs](src/lsm_storage.rs).
+Read **[LsmStorageInner::scan](src/lsm_storage.rs#L842)** in [lsm_storage.rs](src/lsm_storage.rs).
 The numbered comments follow its construction steps:
 
-1. [Clone the source layout](src/lsm_storage.rs#L816) under the read lock, then release the lock.
-2. [Create bounded memory cursors](src/lsm_storage.rs#L823) in priority order and merge them.
-3. [Build L0 cursors](src/lsm_storage.rs#L834): use **[range_overlap](src/lsm_storage.rs#L158)** to skip irrelevant L0 tables, seek the remaining tables
+1. [Clone the source layout](src/lsm_storage.rs#L850) under the read lock, then release the lock.
+2. [Create bounded memory cursors](src/lsm_storage.rs#L857) in priority order and merge them.
+3. [Build L0 cursors](src/lsm_storage.rs#L868): use **[range_overlap](src/lsm_storage.rs#L158)** to skip irrelevant L0 tables, seek the remaining tables
    to the lower bound, and merge their cursors.
-4. [Build level/tier cursors](src/lsm_storage.rs#L871). On the first pass, treat these as one more sorted
+4. [Build level/tier cursors](src/lsm_storage.rs#L905). On the first pass, treat these as one more sorted
    source group; section 6 explains their construction.
-5. [Merge the groups](src/lsm_storage.rs#L908) with memory preferred over L0, and L0 over levels/tiers.
-6. [Wrap the result](src/lsm_storage.rs#L913) in `LsmIterator`, then `FusedIterator`.
+5. [Merge the groups](src/lsm_storage.rs#L942) with memory preferred over L0, and L0 over levels/tiers.
+6. [Wrap the result](src/lsm_storage.rs#L947) in `LsmIterator`, then `FusedIterator`.
 
 Read [lsm_iterator.rs](src/lsm_iterator.rs) next:
 
@@ -187,15 +196,15 @@ must check the bound too.
 
 ## 5. Follow a point lookup — book Task 3: Read Path - Get
 
-Read **[LsmStorageInner::get](src/lsm_storage.rs#L517)** in [lsm_storage.rs](src/lsm_storage.rs), following
+Read **[LsmStorageInner::get](src/lsm_storage.rs#L536)** in [lsm_storage.rs](src/lsm_storage.rs), following
 its numbered comments:
 
-1. [Clone the layout](src/lsm_storage.rs#L518) and release the state lock.
-2. [Probe memory](src/lsm_storage.rs#L526): call `MemTable::get` on current, then immutable memtables. Return immediately
+1. [Clone the layout](src/lsm_storage.rs#L537) and release the state lock.
+2. [Probe memory](src/lsm_storage.rs#L545): call `MemTable::get` on current, then immutable memtables. Return immediately
    on the first occurrence, including a tombstone.
-3. Inspect the **[keep_table closure](src/lsm_storage.rs#L549)** and **[key_within](src/lsm_storage.rs#L188)**. For candidate SSTs,
-   [Seek and merge L0 tables](src/lsm_storage.rs#L569), then [build the level/tier cursors](src/lsm_storage.rs#L581) and merge the disk sources in priority order.
-4. [Inspect the final condition](src/lsm_storage.rs#L599): cursor valid **and key exactly equal and value
+3. Inspect the **[keep_table closure](src/lsm_storage.rs#L568)** and **[key_within](src/lsm_storage.rs#L188)**. For candidate SSTs,
+   [Seek and merge L0 tables](src/lsm_storage.rs#L588), then [build the level/tier cursors](src/lsm_storage.rs#L600) and merge the disk sources in priority order.
+4. [Inspect the final condition](src/lsm_storage.rs#L618): cursor valid **and key exactly equal and value
    nonempty**. Copy the winning value into owned `Bytes`, or return `None`.
 
 The Bloom-filter check is a later optimization. For the core chapter, think of

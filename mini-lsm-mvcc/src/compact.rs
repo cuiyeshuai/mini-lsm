@@ -135,13 +135,18 @@ impl LsmStorageInner {
         let mut builder = None;
         let mut entries_in_builder: usize = 0;
         let mut new_sst = Vec::new();
+        // watermark() acquires/releases ts inside that call. Capture once; no ts
+        // guard is held during the rewrite. The captured watermark is conservative
+        // if readers leave or newer transactions begin while compaction runs.
         let watermark = self.mvcc().watermark();
-        // Physical rewrite must preserve every active snapshot, not just today's
+        // Ordinary GC preserves every active snapshot, not just today's
         // latest values. Keep all versions > watermark plus the first <= watermark
         // for each key as its older readers' baseline (subject to deletion/filter rules).
         // At watermark=6, versions a@9,a@7,a@4,a@1 retain 9,7,4; only 1 is obsolete.
         let mut last_key = Vec::<u8>::new();
         let mut first_key_below_watermark = false;
+        // Acquire/clone/release at this statement; later filter registrations apply
+        // to future rewrites, not this captured policy. No filter lock spans SST I/O.
         let compaction_filters = self.compaction_filters.lock().clone();
         'outer: while iter.is_valid() {
             if builder.is_none() {
@@ -232,7 +237,7 @@ impl LsmStorageInner {
         if let Some(builder) = builder
             && entries_in_builder > 0
         {
-            let sst_id = self.next_sst_id(); // lock dropped here
+            let sst_id = self.next_sst_id(); // Atomic id allocation; no lock guard here.
             let sst = Arc::new(builder.build(
                 sst_id,
                 Some(self.block_cache.clone()),
@@ -247,7 +252,7 @@ impl LsmStorageInner {
         let snapshot = {
             let state = self.state.read();
             state.clone()
-        };
+        }; // Release state.read(); the cloned layout Arc keeps input objects alive.
         match task {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
@@ -343,7 +348,7 @@ impl LsmStorageInner {
         let snapshot = {
             let state = self.state.read();
             state.clone()
-        };
+        }; // Release state.read(); the cloned layout Arc keeps input objects alive.
 
         let l0_sstables = snapshot.l0_sstables.clone();
         let l1_sstables = snapshot.levels[0].1.clone();
@@ -358,7 +363,10 @@ impl LsmStorageInner {
         let mut ids = Vec::with_capacity(sstables.len());
 
         {
+            // Acquire structural mutex for installation through manifest sync.
             let state_lock = self.state_lock.lock();
+            // Clone the layout's collections; their memtables/SSTs remain shared.
+            // This temporary state read guard releases at the semicolon.
             let mut state = self.state.read().as_ref().clone();
             for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
                 let result = state.sstables.remove(sst);
@@ -379,13 +387,14 @@ impl LsmStorageInner {
                 .copied()
                 .collect::<Vec<_>>();
             assert!(l0_sstables_map.is_empty());
+            // Acquire/release a temporary write guard for this assignment only.
             *self.state.write() = Arc::new(state);
             self.sync_dir()?;
             self.manifest.as_ref().unwrap().add_record(
                 &state_lock,
                 ManifestRecord::Compaction(compaction_task, ids.clone()),
             )?;
-        }
+        } // Release structural mutex before deleting obsolete file names.
         for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sst))?;
         }
@@ -399,7 +408,7 @@ impl LsmStorageInner {
         let snapshot = {
             let state = self.state.read();
             state.clone()
-        };
+        }; // Release state.read(); the cloned layout Arc keeps input objects alive.
         let task = self
             .compaction_controller
             .generate_compaction_task(&snapshot);
@@ -411,7 +420,10 @@ impl LsmStorageInner {
         let sstables = self.compact(&task)?;
         let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         let ssts_to_remove = {
+            // Acquire structural mutex AFTER building output; retain through
+            // publication and manifest sync. Flush may have changed the layout.
             let state_lock = self.state_lock.lock();
+            // Temporary read guard releases at this semicolon.
             let mut snapshot = self.state.read().as_ref().clone();
             let mut new_sst_ids = Vec::new();
             for file_to_add in sstables {
@@ -431,12 +443,12 @@ impl LsmStorageInner {
             }
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
-            drop(state);
+            drop(state); // Release state.write(); structural mutex stays held.
             self.sync_dir()?;
             self.manifest()
                 .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             ssts_to_remove
-        };
+        }; // Release structural mutex; publication/persistence errors do not roll back.
         println!(
             "compaction finished: {} files removed, {} files added, output={:?}",
             ssts_to_remove.len(),
@@ -480,7 +492,7 @@ impl LsmStorageInner {
         let res = {
             let state = self.state.read();
             state.imm_memtables.len() >= self.options.num_memtable_limit
-        };
+        }; // Release read guard BEFORE flush acquires structural/state write locks.
         if res {
             self.force_flush_next_imm_memtable()?;
         }

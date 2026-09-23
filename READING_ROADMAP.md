@@ -27,6 +27,18 @@ and includes a trace or checkpoint. Each chapter points to existing tests.
 | 6 | [Write path](WEEK1_ROADMAP.md#day-6--write-path) | [WAL](WEEK2_ROADMAP.md#day-6--write-ahead-log) | [Serializable validation](WEEK3_ROADMAP.md#day-6--serializable-validation) |
 | 7 | [Bloom filters and prefix encoding](WEEK1_ROADMAP.md#day-7--sst-optimizations) | [Batches and checksums](WEEK2_ROADMAP.md#day-7--batch-write-and-checksums) | [Compaction filters](WEEK3_ROADMAP.md#day-7--compaction-filters) |
 
+## Locks and general contracts
+
+Use [Locks, ownership, and guarantees](LOCKING_AND_INVARIANTS.md) throughout the
+course. It gives exact acquisition/release lifetimes, nested lock sequences,
+component preconditions, and the boundaries of snapshot, error, and durability
+claims. The corresponding functions carry inline comments at those transitions.
+
+Start with [guard lifetimes](LOCKING_AND_INVARIANTS.md#1-how-to-recognize-acquisition-and-release)
+and [the lock inventory](LOCKING_AND_INVARIANTS.md#2-what-each-lock-protects).
+For a reusable helper, consult [general component contracts](LOCKING_AND_INVARIANTS.md#8-general-component-contracts-and-their-boundaries)
+before generalizing a chapter-specific example.
+
 ## How to read the annotated code
 
 1. Read the task's purpose and follow its function links in the listed order.
@@ -36,7 +48,9 @@ and includes a trace or checkpoint. Each chapter points to existing tests.
 4. Answer the checkpoint in terms of the invariant being preserved, not merely
    what each line does. For a merge, separate key ordering from duplicate priority;
    for persistence, separate writing bytes from making a layout recoverable.
-5. Revisit the end-of-week trace to connect the individual pieces.
+5. Track every named/temporary guard to its release point, and distinguish shared
+   ownership from a held lock. Ask what an error can leave already changed.
+6. Revisit the end-of-week trace to connect the individual pieces.
 
 These are completed reference solutions. A function can include later lessons:
 Week 1 code already contains checksums and WAL hooks, and Week 3 code already

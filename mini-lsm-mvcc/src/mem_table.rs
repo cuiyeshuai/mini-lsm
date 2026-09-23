@@ -163,9 +163,11 @@ impl MemTable {
 
     /// Implement this in week 3, day 5.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
-        // Append one complete WAL frame before mutating the map. Entries then
-        // become physically present one by one, but readers cannot see the new
-        // timestamp until write_batch_inner publishes it after this call returns.
+        // If WAL is enabled, append one batch frame, then release its file mutex
+        // before inserting entries one by one. This helper does not acquire the
+        // engine's write_lock/state read lock; write_batch_inner holds those.
+        // Atomic visibility comes from that caller publishing ts AFTER this call.
+        // A raw MemTable::scan can see inserted versions; it has no read_ts filter.
         if let Some(ref wal) = self.wal {
             wal.put_batch(data)?;
         }

@@ -67,7 +67,9 @@ impl BlockBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         // Read in three stages: validate encoded lengths, decide whether this
         // block can accept the entry, then append its offset and encoded bytes.
-        // A false result asks SsTableBuilder to finish this block and retry.
+        // For representable key/value lengths, false asks SsTableBuilder to finish
+        // this block and retry. Oversized encoded lengths also return false, but
+        // cannot fit even in an empty block; the engine rejects those at its API.
         assert!(!key.is_empty(), "key must not be empty");
         let Ok(key_len) = u16::try_from(key.len()) else {
             return false;
